@@ -1,0 +1,4 @@
+{
+  "description": "harness-cicd hooks module",
+  "modules": ["./register.js"]
+}

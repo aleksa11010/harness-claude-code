@@ -1,0 +1,12 @@
+{
+  "name": "harness-tools",
+  "description": "Harness plugins for Claude Code",
+  "owner": { "name": "Your Team" },
+  "plugins": [
+    {
+      "name": "harness-cicd",
+      "source": "./plugins/harness-cicd",
+      "description": "Single pane of glass for Harness: your branch's builds, pipeline runs, what's deployed where"
+    }
+  ]
+}

@@ -1,0 +1,170 @@
+{
+  "name": "harness-cicd",
+  "displayName": "Harness CI/CD",
+  "version": "0.7.0",
+  "description": "Single pane of glass for Harness in Claude Code: your branch's builds, pipeline runs, what's deployed where, and environments",
+  "author": {
+    "name": "Your Team"
+  },
+  "keywords": [
+    "harness",
+    "ci",
+    "cd",
+    "deployments",
+    "mod"
+  ],
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Harness API key",
+      "description": "PAT or service-account token with read access. Leave empty to sign in with Harness instead: /mcp \u2192 plugin:harness-cicd:harness \u2192 Authenticate",
+      "sensitive": true
+    },
+    "project_id": {
+      "type": "string",
+      "title": "Project ID",
+      "description": "Harness projectIdentifier to watch"
+    },
+    "org_id": {
+      "type": "string",
+      "title": "Org ID",
+      "description": "Harness orgIdentifier",
+      "default": "default"
+    },
+    "account_id": {
+      "type": "string",
+      "title": "Account ID",
+      "description": "Leave empty to read it from the API key",
+      "default": ""
+    },
+    "base_url": {
+      "type": "string",
+      "title": "Harness URL",
+      "description": "e.g. https://app.harness.io (or your SMP / regional URL)",
+      "default": "https://app.harness.io"
+    },
+    "repo_name": {
+      "type": "string",
+      "title": "Repo name override",
+      "description": "Match runs to this repo name instead of the git origin of the current directory",
+      "default": ""
+    },
+    "poll_seconds": {
+      "type": "number",
+      "title": "Poll interval (seconds)",
+      "description": "How often to refresh (10s while watching a push)",
+      "default": 60,
+      "min": 15,
+      "max": 600
+    },
+    "max_runs": {
+      "type": "number",
+      "title": "Runs to fetch",
+      "description": "Recent executions to fetch per refresh",
+      "default": 50,
+      "min": 10,
+      "max": 100
+    },
+    "auto_open": {
+      "type": "boolean",
+      "title": "Open pane at start",
+      "description": "Open the Harness pane when a session starts (needs a wide terminal)",
+      "default": true
+    },
+    "skip_user_lookup": {
+      "type": "boolean",
+      "title": "Skip user lookup",
+      "description": "Don't call currentUser (use with service-account keys)",
+      "default": false
+    },
+    "on_failure": {
+      "type": "string",
+      "title": "When your commit fails",
+      "description": "notify: toast only \u00b7 ask: offer to let Claude fix it \u00b7 auto: Claude fixes and pushes again, up to the attempt limit",
+      "options": [
+        "notify",
+        "ask",
+        "auto"
+      ],
+      "default": "ask"
+    },
+    "auto_fix_attempts": {
+      "type": "number",
+      "title": "Auto-fix attempts",
+      "description": "Most fix-and-push attempts per pipeline before handing back to you (on_failure: auto)",
+      "default": 2,
+      "min": 1,
+      "max": 5
+    },
+    "push_guard": {
+      "type": "string",
+      "title": "Pushing while red",
+      "description": "hold: ask before Claude pushes onto a failing build \u00b7 warn: toast and push \u00b7 off",
+      "options": [
+        "hold",
+        "warn",
+        "off"
+      ],
+      "default": "hold"
+    },
+    "prod_guard": {
+      "type": "boolean",
+      "title": "Confirm production actions",
+      "description": "Always ask before Claude runs a Harness write action (execute/create/update/delete) that targets production",
+      "default": true
+    },
+    "diagnose": {
+      "type": "string",
+      "title": "Failure diagnosis",
+      "description": "auto: diagnose failures as they appear \u00b7 on_demand: only when you press diagnose \u00b7 off. Uses a small model on your plan",
+      "options": [
+        "auto",
+        "on_demand",
+        "off"
+      ],
+      "default": "auto"
+    },
+    "add_context": {
+      "type": "boolean",
+      "title": "Add Harness context to prompts",
+      "description": "On prompts about builds, deploys or releases, add one line of current Harness state for Claude",
+      "default": true
+    },
+    "layout": {
+      "type": "string",
+      "title": "Pane layout",
+      "description": "stacked \u00b7 focus (branch-first) \u00b7 dock (sidebar in wide fullscreen terminals) \u00b7 strip (band only; pane opens when something fails). Press v in the pane to switch",
+      "options": [
+        "stacked",
+        "focus",
+        "dock",
+        "strip"
+      ],
+      "default": "stacked"
+    },
+    "band": {
+      "type": "boolean",
+      "title": "Band above the prompt",
+      "description": "One line with your commit, a sparkline of recent runs and prod lag",
+      "default": true
+    },
+    "allow_actions": {
+      "type": "boolean",
+      "title": "Allow write actions",
+      "description": "Retry, rerun, abort, approve and reject from the pane. Each asks first; production asks twice",
+      "default": false
+    },
+    "mcp_server": {
+      "type": "string",
+      "title": "Harness MCP server (sign-in mode)",
+      "description": "The server to use when there's no API key, as /mcp lists it",
+      "default": "plugin:harness-cicd:harness"
+    }
+  },
+  "mcpServers": {
+    "harness": {
+      "type": "http",
+      "url": "https://mcp.harness.io/mcp"
+    }
+  }
+}

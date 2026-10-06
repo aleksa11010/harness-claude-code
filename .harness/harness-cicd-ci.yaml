@@ -1,0 +1,45 @@
+# CI for the harness-cicd Claude Code plugin, as created in Harness (default / Playground_Aleksa).
+# Trigger "On push to main" runs it on every push to main in the harness-tools repo.
+pipeline:
+  name: harness-cicd plugin CI
+  identifier: harness_cicd_plugin_ci
+  orgIdentifier: default
+  projectIdentifier: Playground_Aleksa
+  description: Validates and tests the harness-cicd Claude Code plugin on every push to harness-tools.
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        repoName: harness-tools
+        build: <+input>
+  stages:
+    - stage:
+        name: Validate and test
+        identifier: validate_and_test
+        type: CI
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Validate and test the plugin
+                  identifier: validate_and_test_plugin
+                  spec:
+                    shell: Bash
+                    command: |-
+                      set -euo pipefail
+                      npm install -g --prefix "$HOME/.claude-cli" @anthropic-ai/claude-code
+                      export PATH="$HOME/.claude-cli/bin:$PATH"
+                      claude --version
+                      claude plugin validate --strict .
+                      cd plugins/harness-cicd
+                      claude plugin test
