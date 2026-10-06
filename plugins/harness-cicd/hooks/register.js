@@ -16,6 +16,8 @@ import {
   isApprovalWaiting, parseApprovals, expiresIn, approvalWhere, approvalBody,
   parseTemplateInputs, fillTemplate, parseFreeze, freezeText, harnessCodeRef, isGithubRemote,
   parseHarnessPr, parseGhPr, prLine, summarizeChecks, mcpJson, mcpItems, accountFromUrl,
+  buildInventory, mergeRuns, inventoryCell, inventoryText, servicesInRepo, execRepoKeys,
+  parseManifests, connectorScope, repoManifestPaths,
 } from './lib.js'
 
 const PANE = 'harness'
@@ -51,7 +53,15 @@ const SIGN_IN = 'Harness sign-in needed: run /mcp, choose the Harness server, Au
 const LAYOUTS = ['stacked', 'focus', 'dock', 'strip']
 let layout = 'stacked'
 // Pane interaction state: selected run, expanded diagnosis cards, actions menu, dock tab
-const view = { selected: null, expanded: new Set(), collapsed: new Set(), menu: false, tab: 'runs' }
+const view = { selected: null, expanded: new Set(), collapsed: new Set(), menu: false, tab: 'runs', mode: 'runs', invSel: null, invOpen: new Set() }
+// Deployment inventory: CD runs from the last `inventory_days`, scanned only while someone uses it
+const inv = { store: new Map(), scannedAt: 0, usedAt: 0, scanning: null, runs: 0, error: '' }
+const INV_RESCAN_MS = 10 * 60 * 1000
+// CD-only repos: Git connectors behind service manifests, and manifest changes not yet deployed
+const connectors = new Map() // connectorRef → { url, type: 'Repo' | 'Account' } | null (unreadable)
+let connectorsAt = 0
+let pendingChanges = new Map() // service \0 env → commits touching the service's manifests since its last good deploy
+const pendingCache = new Map() // "paths|since" → count
 const pick = (v, allowed, dflt) => (allowed.includes(v) ? v : dflt)
 
 // ---- Harness REST -----------------------------------------------------------
@@ -62,10 +72,9 @@ async function harness($, method, path, params, body) {
 
 // Most Harness APIs wrap results in { data }; Harness Code answers bare JSON
 async function harnessJson($, method, path, params, body) {
-  const qs = new URLSearchParams({
-    routingId: cfg.account_id, accountIdentifier: cfg.account_id,
-    orgIdentifier: cfg.org_id, projectIdentifier: cfg.project_id, ...params,
-  })
+  const all = { routingId: cfg.account_id, accountIdentifier: cfg.account_id, orgIdentifier: cfg.org_id, projectIdentifier: cfg.project_id, ...params }
+  for (const k of Object.keys(all)) if (all[k] === null || all[k] === undefined) delete all[k]
+  const qs = new URLSearchParams(all)
   const res = await $.http.fetch(cfg.base_url + path + '?' + qs.toString(), {
     method,
     headers: { 'x-api-key': cfg.api_key, 'Content-Type': typeof body === 'string' ? 'application/yaml' : 'application/json', Accept: 'application/json' },
@@ -110,11 +119,14 @@ async function readGit($) {
   if (!repo && !cfg.repo_name) return null
   let branch = null
   let head = null
+  let headTime = 0
   try {
     const b = await $.process.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], { timeoutMs: 5000 })
     if (b.exitCode === 0) branch = b.stdout.trim()
     const h = await $.process.run(['git', 'rev-parse', 'HEAD'], { timeoutMs: 5000 })
     if (h.exitCode === 0) head = h.stdout.trim()
+    const ht = await $.process.run(['git', 'log', '-1', '--format=%ct', 'HEAD'], { timeoutMs: 5000 })
+    if (ht.exitCode === 0 && /^\d+$/.test(ht.stdout.trim())) headTime = Number(ht.stdout.trim()) * 1000
   } catch {
     // $.process is CLI-only; in the Desktop app fall back to reading .git/HEAD
     try {
@@ -126,7 +138,7 @@ async function readGit($) {
   return {
     root: repo?.root ?? '', remote: repo?.remote ?? '',
     name: repoKey(cfg.repo_name || repo?.remote || repo?.root),
-    branch: branch === 'HEAD' ? null : branch, head,
+    branch: branch === 'HEAD' ? null : branch, head, headTime,
   }
 }
 
@@ -179,7 +191,13 @@ async function doRefresh($) {
     error = null
     failures = 0
     updatedAt = await $.clock.now()
+    await fetchConnectors($)
+    data.connectors = connectors
     behind = await countBehind($)
+    mergeRuns(inv.store, data.executions)
+    await countPendingChanges($)
+    const inUse = updatedAt - inv.usedAt < 30 * 60_000
+    if (inUse && updatedAt - inv.scannedAt >= INV_RESCAN_MS) scanInventory($) // background; the pane redraws when done
     await Promise.all([fetchApprovals($), fetchFreeze($), fetchPr($)])
     notify($)
   } catch (err) {
@@ -254,6 +272,148 @@ async function fetchPr($) {
     pr = null
     prError = fit(String(err?.message ?? err), 120)
   }
+}
+
+// ---- CD-only repos ------------------------------------------------------------------------
+
+// Read the Git connectors behind service manifests (every 30 min): repo-level connectors hold the repo URL
+async function fetchConnectors($) {
+  if (!data.git?.name) return
+  const now = await $.clock.now()
+  if (connectorsAt && now - connectorsAt < 30 * 60_000) return
+  connectorsAt = now
+  const refs = [...new Set(data.services.flatMap((x) => parseManifests(x.yaml).map((m) => m.connectorRef)).filter(Boolean))].slice(0, 15)
+  await Promise.all(refs.map(async (ref) => {
+    const { id, scope: sc } = connectorScope(ref)
+    try {
+      const d = cfg.auth === 'mcp'
+        ? await mcp($, 'harness_get', { resource_type: 'connector', resource_id: id, resource_scope: sc, ...(sc === 'account' ? { org_id: undefined, project_id: undefined } : sc === 'org' ? { project_id: undefined } : {}) })
+        : await harness($, 'GET', '/ng/api/connectors/' + encodeURIComponent(id), sc === 'account' ? { orgIdentifier: null, projectIdentifier: null } : sc === 'org' ? { projectIdentifier: null } : {})
+      const spec = (d?.connector ?? d)?.spec ?? {}
+      connectors.set(ref, spec.url ? { url: String(spec.url), type: spec.type === 'Repo' ? 'Repo' : 'Account' } : null)
+    } catch {
+      connectors.set(ref, null)
+    }
+  }))
+}
+
+const repoServiceIds = () => servicesInRepo(data.services, data.git?.name || '', connectors)
+// A repo Harness deploys from but never builds: no run carries this repo as its codebase
+function isCdOnly() {
+  const key = data.git?.name || ''
+  if (!key || !repoServiceIds().size) return false
+  return ![...data.executions, ...inv.store.values()].some((x) => execRepoKeys(x).has(key))
+}
+const deploysRepoService = (x) => { const ids = repoServiceIds(); return cdTargets(x).some((t) => ids.has(t.service)) }
+
+// Newest successful deploy per service × environment, across recent runs and the inventory
+function lastGoodDeploys() {
+  const out = new Map()
+  for (const x of [...data.executions, ...inv.store.values()]) {
+    for (const t of cdTargets(x)) {
+      if (t.status !== 'Success' || !t.env) continue
+      const k = t.service + '\u0000' + t.env
+      if (!out.has(k) || out.get(k).at < t.startTs) out.set(k, { at: t.startTs, run: x })
+    }
+  }
+  return out
+}
+
+// Commits on your branch that touched a service's manifest paths since its last good deploy, per environment
+async function countPendingChanges($) {
+  pendingChanges = new Map()
+  const key = data.git?.name
+  if (!key || !data.git?.head) return
+  const good = lastGoodDeploys()
+  let calls = 0
+  for (const svc of data.services) {
+    const paths = repoManifestPaths(svc, key, connectors)
+    if (!paths.length) continue
+    for (const [k, g] of good) {
+      if (!k.startsWith(svc.identifier + '\u0000') || calls >= 16) continue
+      const since = Math.floor(g.at / 1000)
+      const ck = paths.join(',') + '|' + since
+      if (!pendingCache.has(ck)) {
+        calls++
+        try {
+          const r = await $.process.run(['git', 'rev-list', '--count', `--since=${since}`, 'HEAD', '--', ...paths], { timeoutMs: 5000 })
+          if (r.exitCode === 0) pendingCache.set(ck, Number(r.stdout.trim()))
+        } catch {
+          return // CLI-only
+        }
+      }
+      if (pendingCache.has(ck)) pendingChanges.set(k, pendingCache.get(ck))
+    }
+  }
+}
+
+// The deploy of one of this repo's services that is currently red (newest attempt per service/env failed)
+function cdRedDeploy() {
+  const ids = repoServiceIds()
+  const newest = new Map()
+  for (const x of [...data.executions, ...inv.store.values()]) {
+    for (const t of cdTargets(x)) {
+      if (!ids.has(t.service) || !t.env) continue
+      const k = t.service + '\u0000' + t.env
+      if (!newest.has(k) || newest.get(k).t.startTs < t.startTs) newest.set(k, { x, t })
+    }
+  }
+  return [...newest.values()].filter((v) => statusKind(v.t.status) === 'fail').sort((a, b) => b.t.startTs - a.t.startTs)[0] ?? null
+}
+
+const pendingText = (n) => (n === 0 ? 'up to date' : `${n} change${n === 1 ? '' : 's'} pending`)
+
+// ---- Deployment inventory scan ---------------------------------------------------------------
+
+function scanInventory($) {
+  if (!inv.scanning) inv.scanning = doScanInventory($).finally(() => { inv.scanning = null; $.ui.invalidate('ui.render') })
+  return inv.scanning
+}
+
+async function doScanInventory($) {
+  const now = await $.clock.now()
+  const cutoff = now - cfg.inventory_days * 86400_000
+  let fetched = 0
+  try {
+    for (let page = 0; fetched < cfg.inventory_max_runs; page++) {
+      const batch = cfg.auth === 'mcp'
+        ? mcpItems(await mcp($, 'harness_list', { resource_type: 'execution', filters: { module: 'CD' }, page, size: 100, compact: false }))
+        : (await harness($, 'POST', '/pipeline/api/pipelines/execution/summary', { module: 'CD', page: String(page), size: '100' }, { filterType: 'PipelineExecution' }))?.content ?? []
+      if (!batch.length) break
+      mergeRuns(inv.store, batch)
+      fetched += batch.length
+      if (batch.length < 100 || Math.min(...batch.map((x) => x.startTs || now)) < cutoff) break
+    }
+    for (const [id, x] of inv.store) if ((x.startTs || 0) < cutoff) inv.store.delete(id)
+    inv.runs = fetched
+    inv.scannedAt = now
+    inv.error = ''
+  } catch (err) {
+    inv.error = fit(String(err?.message ?? err), 140)
+  }
+}
+
+// Services related to this repo: manifests in it, or deployed by runs that built it
+function repoServices() {
+  const key = data.git?.name || ''
+  const out = servicesInRepo(data.services, key, connectors) // same matching as the pane, connectors included
+  for (const x of inv.store.values()) if (key && execRepoKeys(x).has(key)) for (const t of cdTargets(x)) out.add(t.service)
+  return out
+}
+
+function currentInventory() {
+  const all = buildInventory([...inv.store.values()], data.services, data.environments)
+  if (scope !== 'mine') return { ...all, scopeLabel: 'whole project' }
+  const mine = repoServices()
+  return mine.size ? { ...all, rows: all.rows.filter((r) => mine.has(r.id)), scopeLabel: 'this repo' } : { ...all, scopeLabel: 'whole project (no services found for this repo)' }
+}
+
+async function openInventory($) {
+  inv.usedAt = await $.clock.now()
+  if (view.mode !== 'inventory') scope = 'all' // the inventory is project-wide; 1 narrows it to this repo
+  view.mode = 'inventory'
+  if (!inv.scannedAt && !inv.scanning) scanInventory($)
+  $.ui.invalidate('ui.render')
 }
 
 // ---- Runtime inputs: reuse what the run used; otherwise ask for each (null = cancelled) ----
@@ -489,7 +649,14 @@ function diagnose($, x) {
 const doneDiag = (id) => (diagnoses.get(id)?.state === 'done' ? diagnoses.get(id) : null)
 
 // Your HEAD commit just failed: notify, ask, or auto-fix (setting: on_failure)
-async function onYourFailure($, x) {
+function manifestHint(x, manifestChange) {
+  if (!manifestChange) return ''
+  const ids = repoServiceIds()
+  const paths = data.services.filter((y) => ids.has(y.identifier) && cdTargets(x).some((t) => t.service === y.identifier)).flatMap((y) => repoManifestPaths(y, data.git?.name, connectors))
+  return `\nThis repo holds the deployment manifests (no build in Harness)${paths.length ? `: ${[...new Set(paths)].join(', ')}` : ''}. Look at what changed there since the last successful deploy.`
+}
+
+async function onYourFailure($, x, manifestChange = false) {
   const key = x.pipelineIdentifier + '@' + (data.git?.branch ?? '')
   view.selected = x.planExecutionId
   view.expanded.add(x.planExecutionId)
@@ -505,21 +672,23 @@ async function onYourFailure($, x) {
       return
     }
     fixAttempts.set(key, n)
-    $.prompt.submit({ text: autoFixPrompt(x, d, n, cfg.auto_fix_attempts, execUrl(cfg, x)) })
+    $.prompt.submit({ text: autoFixPrompt(x, d, n, cfg.auto_fix_attempts, execUrl(cfg, x)) + manifestHint(x, manifestChange) })
     return
   }
   let answer = ''
   try {
-    answer = await $.ui.ask(`${x.name ?? x.pipelineIdentifier} #${x.runSequence} failed on your commit: ${fit(d?.cause || failureMessage(x) || x.status, 150)}. What now?`, ['Let Claude fix it', 'Always auto-fix', 'Show the failure', 'Ignore'])
+    const t = cdTargets(x).find((y) => repoServiceIds().has(y.service)) ?? cdTargets(x)[0]
+    const what = manifestChange && t ? `failed deploying ${t.serviceName} to ${t.envName} after your latest manifest change` : 'failed on your commit'
+    answer = await $.ui.ask(`${x.name ?? x.pipelineIdentifier} #${x.runSequence} ${what}: ${fit(d?.cause || failureMessage(x) || x.status, 150)}. What now?`, ['Let Claude fix it', 'Always auto-fix', 'Show the failure', 'Ignore'])
   } catch {
     return // dismissed, or nobody to ask
   }
   if (answer === 'Always auto-fix') {
     await setAutoFix($, true)
     fixAttempts.set(key, 1)
-    $.prompt.submit({ text: autoFixPrompt(x, d, 1, cfg.auto_fix_attempts, execUrl(cfg, x)) })
+    $.prompt.submit({ text: autoFixPrompt(x, d, 1, cfg.auto_fix_attempts, execUrl(cfg, x)) + manifestHint(x, manifestChange) })
   } else if (answer === 'Let Claude fix it') {
-    $.prompt.submit({ asUser: true, text: autoFixPrompt(x, d, 1, 1, execUrl(cfg, x)).replace('Auto-fix attempt 1 of 1: f', 'F') })
+    $.prompt.submit({ asUser: true, text: autoFixPrompt(x, d, 1, 1, execUrl(cfg, x)).replace('Auto-fix attempt 1 of 1: f', 'F') + manifestHint(x, manifestChange) })
   } else if (answer === 'Show the failure') {
     await openPane($, true)
   }
@@ -531,7 +700,13 @@ function notify($) {
   const parts = []
   if (v.branch) {
     const h = v.branch.headRun
-    parts.push(`${v.branch.name}@${short(v.branch.head)} ${h ? ICON[statusKind(h.status)] + ' ' + h.status : 'not built'}`)
+    if (!h && !v.branch.latest && isCdOnly()) {
+      // CD-only: no builds to report; say what isn't deployed yet instead
+      const pend = [...pendingChanges].filter(([, n]) => n > 0).map(([k, n]) => `${k.split('\u0000')[1]} ${n} pending`)
+      parts.push(`${v.branch.name}@${short(v.branch.head)} CD-only${pend.length ? ' · ' + pend.join(', ') : ' · manifests deployed'}`)
+    } else {
+      parts.push(`${v.branch.name}@${short(v.branch.head)} ${h ? ICON[statusKind(h.status)] + ' ' + h.status : 'not built'}`)
+    }
   }
   if (v.counts.running) parts.push(`${v.counts.running} running`)
   // Runs waiting on an approval are counted once, as approvals (below)
@@ -566,7 +741,10 @@ function notify($) {
       }
       if ((finished || newFailure) && now === 'fail') {
         const yours = data.git?.head && execCi(x)?.commit === data.git.head
+        // CD-only: a deploy of this repo's services that started after your latest commit carries your manifest change
+        const yourDeploy = !yours && isCdOnly() && deploysRepoService(x) && data.git?.headTime && (x.startTs || 0) >= data.git.headTime
         if (yours) $.clock.after(0, () => { onYourFailure($, x) })
+        else if (yourDeploy) $.clock.after(0, () => { onYourFailure($, x, true) })
         else if (cfg.diagnose === 'auto') $.clock.after(0, () => { diagnose($, x) })
       }
       if (finished && now === 'ok') fixAttempts.delete(x.pipelineIdentifier + '@' + (data.git?.branch ?? ''))
@@ -598,6 +776,8 @@ export function register(on, options) {
     add_context: options.add_context !== false,
     layout: pick(options.layout, LAYOUTS, 'stacked'),
     mcp_server: String(options.mcp_server || 'plugin:harness-cicd:harness'),
+    inventory_days: Math.min(365, Math.max(7, Number(options.inventory_days) || 90)),
+    inventory_max_runs: Math.min(2000, Math.max(100, Number(options.inventory_max_runs) || 500)),
     band: options.band !== false,
     allow_actions: options.allow_actions === true,
     org_explicit: Boolean(options.org_id) && options.org_id !== 'default',
@@ -653,10 +833,11 @@ export function register(on, options) {
         properties: {
           scope: { type: 'string', enum: ['mine', 'all'], description: '"mine" (default): this repo/branch; "all": whole project' },
           diagnose: { type: 'string', description: 'Optional planExecutionId of a failed run to diagnose from its failed steps and log tail' },
+          view: { type: 'string', enum: ['status', 'inventory'], description: '"inventory": the live version of every service in every environment and infrastructure, with drift and in-flight deploys' },
         },
       },
     })
-    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[doctor|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
+    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[inventory|doctor|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
     if (cfg.auto_open && layout !== 'strip') await openPane($, false)
     return next(e)
   })
@@ -666,6 +847,18 @@ export function register(on, options) {
     const arg = raw.toLowerCase()
     if (arg === 'all' || arg === 'mine') scope = arg
     if (arg === 'doctor') return { text: await doctor($) }
+    if (arg === 'inventory' || arg === 'deployments') {
+      if (!lastAttempt || pending) await refresh($)
+      if (scope === 'mine' && !arg.includes('mine')) scope = 'all' // the inventory is project-wide unless you narrow it
+      await openInventory($)
+      const surfaces = await $.session.surfaces()
+      if (!surfaces.some((x) => x === 'terminal' || x === 'desktop')) {
+        await scanInventory($)
+        return { text: error ? 'Harness: ' + error : inventoryText(currentInventory(), await $.clock.now(), currentInventory().scopeLabel) + `\n(live = last successful deploy per service/environment/infrastructure, from ${inv.runs} CD runs over ${cfg.inventory_days} days)` }
+      }
+      await openPane($, true)
+      return {}
+    }
     if (arg === 'autofix on' || arg === 'autofix off') {
       await setAutoFix($, arg === 'autofix on')
       return { text: `Auto-fix ${arg === 'autofix on' ? 'on' : 'off'}.` }
@@ -703,6 +896,27 @@ export function register(on, options) {
   on('tool.call', { tool: TOOL }, async ($, e) => {
     if (!lastAttempt || pending) await refresh($)
     if (error) return { result: 'Harness status unavailable: ' + error }
+    if (e.view === 'inventory') {
+      inv.usedAt = await $.clock.now()
+      if (!inv.scannedAt || inv.scanning) await scanInventory($)
+      const prev = scope
+      scope = e.scope === 'mine' ? 'mine' : 'all'
+      const iv = currentInventory()
+      scope = prev
+      return { result: JSON.stringify({
+        project: `${cfg.org_id}/${cfg.project_id}`, scope: iv.scopeLabel, basis: `last successful deploy per service/environment/infrastructure, from ${inv.runs} CD runs over ${cfg.inventory_days} days`,
+        environments: iv.envs.map((x) => ({ id: x.id, name: x.name, type: x.type })),
+        services: iv.rows.map((r) => ({
+          service: r.name, deployed: r.deployed, drift: r.drift.map((d) => `${d.to} differs from ${d.from}`),
+          environments: Object.fromEntries(Object.entries(r.cells).filter(([, c]) => c).map(([env, c]) => [env, {
+            live: c.live ? { version: c.live.artifact || null, deployed_at: new Date(c.live.at).toISOString(), by: c.live.by || undefined, run: `${c.live.pipeline} #${c.live.run}` } : null,
+            infrastructures: c.infras.length > 1 ? c.infras.map((i) => ({ infra: i.infra, version: i.live?.artifact ?? null })) : undefined,
+            newer_attempt: c.attempt ? { version: c.attempt.artifact || null, status: c.attempt.status, at: new Date(c.attempt.at).toISOString() } : undefined,
+            manifest_changes_not_deployed: pendingChanges.get(r.id + '\u0000' + env),
+          }])),
+        })),
+      }) }
+    }
     if (e.diagnose) {
       const x = data.executions.find((r) => r.planExecutionId === e.diagnose)
       if (!x) return { result: `No recent run with id ${e.diagnose} in ${cfg.org_id}/${cfg.project_id}.` }
@@ -712,6 +926,8 @@ export function register(on, options) {
     const v = buildView(data, e.scope === 'all' ? 'all' : 'mine')
     const now = await $.clock.now()
     const summary = toolSummary(v, cfg, now, { diagnoses, behind })
+    summary.cd_only_repo = isCdOnly() || undefined
+    summary.manifest_changes_pending = pendingChanges.size ? Object.fromEntries([...pendingChanges].map(([k, n]) => [k.replace('\u0000', '→'), n])) : undefined
     summary.freeze = freeze?.frozen ? { active: freeze.active.map((f) => ({ name: f.name, until: f.until ? new Date(f.until).toISOString() : null })) } : { active: [] }
     summary.pull_request = pr ? { number: pr.number, title: pr.title, draft: pr.draft, target: pr.target, review: pr.review, checks: pr.checks.map((c) => `${c.name}: ${c.status}`), url: pr.url || undefined } : null
     summary.approvals_waiting = waitingList().map(({ x, a }) => ({
@@ -729,10 +945,21 @@ export function register(on, options) {
     // Push guard: hold (ask first), warn (toast), off
     if (pushing && cfg.push_guard !== 'off' && updatedAt && !error) {
       const v = buildView(data, 'mine')
-      const last = v.branch?.latest
-      if (last && statusKind(last.status) === 'fail') {
+      let last = v.branch?.latest && statusKind(v.branch.latest.status) === 'fail' ? v.branch.latest : null
+      let why = ''
+      if (last) {
         const msg = failureMessage(last)
-        const why = `${v.branch.name} is red in Harness: ${last.name ?? last.pipelineIdentifier} #${last.runSequence} ${last.status}` + (msg ? ` (${fit(msg, 120)})` : '')
+        why = `${v.branch.name} is red in Harness: ${last.name ?? last.pipelineIdentifier} #${last.runSequence} ${last.status}` + (msg ? ` (${fit(msg, 120)})` : '')
+      } else if (!v.branch?.latest && isCdOnly()) {
+        // CD-only: your push changes manifests; hold it while the last deploy of one of this repo's services is failing
+        const red = cdRedDeploy()
+        if (red) {
+          last = red.x
+          const msg = failureMessage(red.x)
+          why = `the last deploy of ${red.t.serviceName} to ${red.t.envName} failed in Harness (${red.x.name ?? red.x.pipelineIdentifier} #${red.x.runSequence}${msg ? `: ${fit(msg, 100)}` : ''})`
+        }
+      }
+      if (last) {
         if (cfg.push_guard === 'warn') {
           $.ui.toast('Pushing while ' + why, { timeoutMs: 8000 })
         } else {
@@ -787,7 +1014,8 @@ export function register(on, options) {
   // Automatic context: one short line of Harness state on CI/deploy prompts
   on('prompt.submit', async ($, e, next) => {
     if (!cfg.add_context || !updatedAt || error || !wantsContext(e.text)) return next(e)
-    const line = contextLine(buildView(data, 'mine'), { behind, diagnoses, pr: pr ? prLine(pr) : '', freeze: freeze?.frozen ? freezeText(freeze) : '' })
+    const pend = [...pendingChanges].filter(([, n]) => n > 0).map(([k, n]) => { const [svc, env] = k.split('\u0000'); return `${data.services.find((x) => x.identifier === svc)?.name ?? svc}→${env}: ${n} manifest change${n === 1 ? '' : 's'} not deployed` })
+    const line = contextLine(buildView(data, 'mine'), { behind, diagnoses, pr: [pr ? prLine(pr) : '', isCdOnly() ? 'CD-only repo (manifests here, no build in Harness)' : '', ...pend].filter(Boolean).join('; '), freeze: freeze?.frozen ? freezeText(freeze) : '' })
     return line ? next({ ...e, context: [...(e.context ?? []), line] }) : next(e)
   })
 
@@ -1001,6 +1229,7 @@ function renderPane($, el, props, now) {
       Button({ key: 'scope-mine', label: narrow ? 'Repo' : 'This repo', hotkey: '1', plain: true, dimColor: scope !== 'mine', onPress: () => { scope = 'mine'; redraw() } }),
       Button({ key: 'scope-all', label: narrow ? 'Project' : 'Whole project', hotkey: '2', plain: true, dimColor: scope !== 'all', onPress: () => { scope = 'all'; redraw() } }),
       Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => { refresh($) } }),
+      Button({ key: 'inventory', label: view.mode === 'inventory' ? (narrow ? 'Runs' : 'Back to runs') : 'Inventory', hotkey: 'i', plain: true, onPress: () => { if (view.mode === 'inventory') { view.mode = 'runs'; redraw() } else { openInventory($) } } }),
       Button({ key: 'layout', label: narrow ? layout : `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
       ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: narrow ? 'Harness' : 'open in Harness' })] : []),
     ],
@@ -1010,6 +1239,10 @@ function renderPane($, el, props, now) {
   if (scope === 'mine' && v.scopeFellBack) {
     const why = v.git ? `No runs found for repo "${v.git.name}"` : 'Not in a git repo'
     children.push(T(fit(`${why} — showing ${v.mineBasis === 'me' ? 'runs you triggered' : 'the whole project'}.`, W), { dimColor: true }))
+  }
+  if (view.mode === 'inventory') {
+    children.push(...renderInventory($, el, T, W, now, docked))
+    return Box({ flexDirection: 'column', children })
   }
   children.push(...renderApprovals($, el, T, W, now))
   if (effective === 'focus') children.push(...renderFocus($, el, T, W, v, sel, now))
@@ -1066,7 +1299,9 @@ function renderBranch(el, T, W, v, now) {
     children: [
       T(fit(`${v.git.name} @ ${v.branch.name}  HEAD ${short(v.branch.head) || '?'}`, Math.floor(W * 0.45)), { bold: true }),
       ...(typeof behind === 'number' ? [T(behind ? `prod ${behind} behind` : 'prod is current', { dimColor: true })] : []),
-      h ? kindText(T, h.status, `${h.status} · #${h.runSequence} ${ago(h.startTs, now)}`) : T(latest ? 'HEAD not built yet' : 'no runs on this branch', { color: 'yellow' }),
+      h ? kindText(T, h.status, `${h.status} · #${h.runSequence} ${ago(h.startTs, now)}`)
+        : !latest && isCdOnly() ? T(fit(`CD-only: deploys ${data.services.filter((x) => repoServiceIds().has(x.identifier)).map((x) => x.name).join(', ')} from manifests here`, Math.max(20, W - Math.floor(W * 0.45) - 2)), { dimColor: true })
+        : T(latest ? 'HEAD not built yet' : 'no runs on this branch', { color: 'yellow' }),
       ...(h ? [Link({ href: execUrl(cfg, h), label: 'open' })] : []),
     ],
   }))
@@ -1183,7 +1418,8 @@ function laneData(v, now) {
     segs: v.matrix.envs.map((env) => {
       const c = s.cells[env.id]
       const n = behindByCommit.get(commits.get(s.id + '\u0000' + env.id))
-      const lag = n === 0 ? 'HEAD' : typeof n === 'number' ? `${n} behind` : ''
+      const p = pendingChanges.get(s.id + '\u0000' + env.id)
+      const lag = n === 0 ? 'HEAD' : typeof n === 'number' ? `${n} behind` : typeof p === 'number' ? pendingText(p) : ''
       return {
         label: (env.type === 'Production' ? '★ ' : '') + env.name + ' ',
         cell: c ? `${ICON[statusKind(c.status)]} ${fit(c.artifact || '#' + (c.execution?.runSequence ?? ''), 12)}` : '—',
@@ -1342,6 +1578,13 @@ async function doctor($) {
   ok('Services & environments', `${data.services.length} services, ${data.environments.length} environments (${data.environments.filter((e) => e.type === 'Production').length} production)`)
   if (cfg.auth === 'key') data.me ? ok('User', data.me) : note('User', 'no user behind this key (service account?): "runs you triggered" is unavailable')
   data.git ? ok('Git', `${data.git.name} @ ${data.git.branch ?? '(detached)'} ${short(data.git.head)}`) : note('Git', 'not in a git repo: showing the whole project')
+  if (data.git?.name) {
+    const refs = [...connectors.keys()]
+    const unreadable = refs.filter((r) => connectors.get(r) === null)
+    const mine = data.services.filter((x) => repoServiceIds().has(x.identifier)).map((x) => x.name)
+    if (refs.length) unreadable.length ? bad('Git connectors', `${refs.length - unreadable.length}/${refs.length} readable; can't read ${unreadable.join(', ')} (needs view on connectors), so services using them can't be matched to this repo`) : ok('Git connectors', `${refs.length} read to match service manifests to this repo`)
+    if (mine.length) ok('Services from this repo', `${mine.join(', ')}${isCdOnly() ? ' — CD-only repo: matched by manifests; pending manifest changes tracked per environment' : ''}`)
+  }
 
   const x = data.executions.find((r) => statusKind(r.status) === 'fail') ?? data.executions[0]
   if (x) {
@@ -1385,4 +1628,101 @@ async function doctor($) {
   note('Behaviour', `diagnose ${cfg.diagnose} · on failure ${cfg.on_failure} · push guard ${cfg.push_guard} · prod guard ${cfg.prod_guard ? 'on' : 'off'} · actions ${cfg.allow_actions ? 'on' : 'off'}`)
   note('Write permissions', 'Harness checks them when you act; a refusal shows Harness\'s own message')
   return L.join('\n')
+}
+
+// ---- Inventory view: every service × environment, live version, drift, details -----------------
+
+function renderInventory($, el, T, W, now, vertical) {
+  const { Box, Button, Link } = el
+  const iv = currentInventory()
+  const redraw = () => $.ui.invalidate('ui.render')
+  const out = []
+  const deployed = iv.rows.filter((r) => r.deployed)
+  const status = inv.scanning && !inv.scannedAt ? 'scanning deploy history…' : inv.error ? '⚠ ' + inv.error : `${inv.runs} CD runs · ${cfg.inventory_days}d · scanned ${ago(inv.scannedAt, now) || 'now'}${inv.scanning ? ' · rescanning' : ''}`
+  out.push(section(T, W, `DEPLOYMENTS (${iv.scopeLabel}) · ${deployed.length} services × ${iv.envs.length} environments`))
+  if (!deployed.length) {
+    out.push(T(inv.scannedAt ? 'No deployments in the window.' : 'Loading deployments…', { dimColor: true }))
+    out.push(T(status, { dimColor: true }))
+    return out
+  }
+  if (!view.invSel || !deployed.some((r) => r.id === view.invSel)) view.invSel = deployed[0].id
+  const nameW = Math.min(22, Math.max(12, ...deployed.map((r) => Array.from(r.name).length + 3)))
+  const colW = Math.max(14, Math.min(22, Math.floor((W - nameW - 8) / Math.max(1, iv.envs.length))))
+  const fitEnvs = vertical ? iv.envs : iv.envs.slice(0, Math.max(1, Math.floor((W - nameW - 8) / colW)))
+  if (!vertical) {
+    out.push(T(pad('', nameW) + fitEnvs.map((e) => pad((e.type === 'Production' ? '★ ' : '') + e.name, colW)).join('') + (iv.envs.length > fitEnvs.length ? `+${iv.envs.length - fitEnvs.length}` : ''), { bold: true }))
+  }
+  for (const r of deployed) {
+    const sel = r.id === view.invSel
+    const open = view.invOpen.has(r.id)
+    if (vertical) {
+      out.push(Box({ key: 'inv-' + r.id, flexDirection: 'row', columnGap: 1, children: [T(sel ? '❯' : ' ', { color: 'blue' }), T(r.name + (r.drift.length ? '  ⚠ drift' : ''), { bold: true, inverse: sel })] }))
+      for (const e of iv.envs) {
+        const c = inventoryCell(r.cells[e.id], now)
+        if (r.cells[e.id]) out.push(Box({ flexDirection: 'row', columnGap: 1, children: [T('   ' + pad((e.type === 'Production' ? '★ ' : '') + e.name, 12)), T(c.text, { color: COLOR[c.kind] })] }))
+      }
+    } else {
+      out.push(Box({
+        key: 'inv-' + r.id, flexDirection: 'row',
+        children: [
+          T(sel ? '❯ ' : '  ', { color: 'blue' }),
+          T(pad(r.name, nameW - 3), { bold: true, inverse: sel }),
+          T(' '),
+          ...fitEnvs.map((e) => { const c = inventoryCell(r.cells[e.id], now); return T(pad(c.text, colW), { color: COLOR[c.kind], dimColor: c.kind === 'idle' }) }),
+          ...(r.drift.length ? [T('⚠ ' + r.drift.map((d) => `${d.to} ≠ ${d.from}`).join(', '), { color: 'yellow' })] : []),
+        ],
+      }))
+    }
+    if (open) out.push(...renderInventoryDetail(el, T, W, iv, r, now))
+  }
+  const idle = iv.rows.filter((r) => !r.deployed)
+  if (idle.length) out.push(T(fit(`not deployed in ${cfg.inventory_days} days: ${idle.map((r) => r.name).join(', ')}`, W), { dimColor: true }))
+  out.push(T(fit(`live = last good deploy per environment/infrastructure · ${status}`, W), { dimColor: true }))
+  out.push(Box({
+    flexDirection: 'row', columnGap: 2,
+    children: [
+      Button({ key: 'inv-down', label: 'j ↓', hotkey: 'j', plain: true, dimColor: true, onPress: () => { moveInventory(deployed, 1); redraw() } }),
+      Button({ key: 'inv-up', label: 'k ↑', hotkey: 'k', plain: true, dimColor: true, onPress: () => { moveInventory(deployed, -1); redraw() } }),
+      Button({ key: 'inv-expand', label: 'e details', hotkey: 'e', plain: true, dimColor: true, onPress: () => { view.invOpen.has(view.invSel) ? view.invOpen.delete(view.invSel) : view.invOpen.add(view.invSel); redraw() } }),
+      Button({ key: 'inv-rescan', label: 'r rescan', hotkey: 'r', plain: true, dimColor: true, onPress: () => { scanInventory($) } }),
+      Button({ key: 'inv-back', label: 'i back to runs', hotkey: 'i', plain: true, dimColor: true, onPress: () => { view.mode = 'runs'; redraw() } }),
+    ],
+  }))
+  return out
+}
+
+function moveInventory(rows, d) {
+  const i = rows.findIndex((r) => r.id === view.invSel)
+  const next = rows[Math.min(rows.length - 1, Math.max(0, (i === -1 ? 0 : i) + d))]
+  if (next) view.invSel = next.id
+}
+
+// Every environment and infrastructure of one service: live version, when, who, which run; newer attempts
+function renderInventoryDetail(el, T, W, iv, r, now) {
+  const { Box, Link } = el
+  const out = []
+  for (const e of iv.envs) {
+    const c = r.cells[e.id]
+    if (!c) continue
+    for (const i of c.infras) {
+      const l = i.live
+      const where = `${(e.type === 'Production' ? '★ ' : '') + e.name}${c.infras.length > 1 || i.infra ? ' · ' + (i.infra || 'default') : ''}`
+      const url = (l ?? i.attempt) ? execUrl(cfg, { pipelineIdentifier: (l ?? i.attempt).pipelineId, planExecutionId: (l ?? i.attempt).execution, openInHarness: (l ?? i.attempt).url }) : ''
+      out.push(Box({
+        flexDirection: 'row', columnGap: 1,
+        children: [
+          T('    │', { dimColor: true }),
+          T(pad(where, 24)),
+          l ? T(pad(l.artifact || '#' + l.run, 16), { color: 'green' }) : T(pad('nothing live', 16), { dimColor: true }),
+          T(fit(l ? `${ago(l.at, now) === 'now' ? 'just now' : ago(l.at, now) + ' ago'}${l.by ? ' by ' + l.by : ''} · ${l.pipeline} #${l.run}${l.commit ? ' @' + short(l.commit) : ''}` : '', Math.max(10, W - 52)), { dimColor: true }),
+          ...(url ? [Link({ href: url, label: 'open' })] : []),
+        ],
+      }))
+      const p = pendingChanges.get(r.id + '\u0000' + e.id)
+      if (typeof p === 'number' && i === c.infras[0]) out.push(T(fit(`    │   manifests in this repo: ${p ? `${p} commit${p === 1 ? '' : 's'} since this deploy, not deployed yet` : 'no changes since this deploy'}`, W), { color: p ? 'yellow' : undefined, dimColor: !p }))
+      if (i.attempt) out.push(T(fit(`    │   ↳ newer: ${i.attempt.artifact || '#' + i.attempt.run} ${i.attempt.status} ${ago(i.attempt.at, now) === 'now' ? 'just now' : ago(i.attempt.at, now) + ' ago'} (${i.attempt.pipeline} #${i.attempt.run})`, W), { color: COLOR[statusKind(i.attempt.status)] }))
+    }
+  }
+  for (const d of r.drift) out.push(T(fit(`    │ ⚠ ${d.to} runs a different version from ${d.from}`, W), { color: 'yellow' }))
+  return out
 }

@@ -136,16 +136,71 @@ export function projectUrl(c) {
   try { return new URL(`${c.base_url}/ng/account/${c.account_id}/all/orgs/${c.org_id}/projects/${c.project_id}/deployments`).href } catch { return '' }
 }
 
-// Services whose manifests live in this repo (from the service YAML)
-export function servicesInRepo(services, key) {
+// Manifests in a service YAML: store type, connector, repo, branch, and the paths they read
+export function parseManifests(yaml) {
+  const lines = String(yaml ?? '').split('\n')
+  const start = lines.findIndex((l) => /^\s*manifests:\s*$/.test(l))
+  if (start === -1) return []
+  const base = lines[start].search(/\S/)
+  const out = []
+  let cur = null
+  let listKey = ''
+  let listIndent = -1
+  const val = (l) => l.replace(/^[^:]+:\s*/, '').replace(/^["']|["']\s*$/g, '').trim()
+  for (let i = start + 1; i < lines.length; i++) {
+    const l = lines[i]
+    if (!l.trim()) continue
+    const ind = l.search(/\S/)
+    if (ind <= base) break
+    if (/^\s*-\s+manifest:\s*$/.test(l)) { cur = { storeType: '', connectorRef: '', repoName: '', branch: '', paths: [] }; out.push(cur); listKey = ''; continue }
+    if (!cur) continue
+    if (listKey && ind > listIndent && /^\s*-\s+/.test(l)) { cur.paths.push(l.replace(/^\s*-\s+/, '').replace(/^["']|["']$/g, '').trim()); continue }
+    listKey = ''
+    const k = /^\s*(?:-\s+)?([A-Za-z]+):/.exec(l)?.[1]
+    if (!k) continue
+    if (k === 'paths' || k === 'valuesPaths' || k === 'files') { listKey = k; listIndent = ind; continue }
+    if (k === 'folderPath') cur.paths.push(val(l))
+    else if (k === 'connectorRef') cur.connectorRef = val(l)
+    else if (k === 'repoName') cur.repoName = val(l)
+    else if (k === 'branch') cur.branch = val(l)
+    else if (k === 'type' && /store:\s*$/.test(lines[i - 1] ?? '')) cur.storeType = val(l)
+  }
+  return out.map((m) => ({ ...m, paths: m.paths.filter((p) => p && !p.startsWith('<+')) }))
+}
+
+// "account.gh" / "org.gh" / "gh" → which scope to read the connector from
+export function connectorScope(ref) {
+  const m = /^(account|org)\.(.+)$/.exec(String(ref ?? ''))
+  return m ? { id: m[2], scope: m[1] } : { id: String(ref ?? ''), scope: 'project' }
+}
+
+// Is this manifest stored in the repo with this key? Repo-level connectors carry the repo in their URL.
+export function manifestInRepo(m, key, connectors) {
+  if (!key) return false
+  if (m.repoName && repoKey(m.repoName) === key) return true
+  const c = connectors?.get?.(m.connectorRef)
+  if (c?.url && c.type === 'Repo' && repoKey(c.url) === key) return true
+  if (c?.url && c.type === 'Account' && m.repoName && repoKey(m.repoName) === key) return true
+  return false
+}
+
+// Services whose manifests live in this repo (service YAML, resolving connectors when known)
+export function servicesInRepo(services, key, connectors) {
   if (!key) return new Set()
   const out = new Set()
-  for (const s of services) {
-    const names = [...String(s?.yaml ?? '').matchAll(/repoName:\s*["']?([^\s"']+)/g)].map((m) => repoKey(m[1]))
-    const urls = [...String(s?.yaml ?? '').matchAll(/(?:repoUrl|url):\s*["']?([^\s"']+)/g)].map((m) => repoKey(m[1]))
-    if ([...names, ...urls].includes(key)) out.add(s.identifier)
+  for (const s of services ?? []) {
+    const y = String(s?.yaml ?? '')
+    const names = [...y.matchAll(/repoName:\s*["']?([^\s"']+)/g)].map((m) => repoKey(m[1]))
+    const urls = [...y.matchAll(/(?:repoUrl|url):\s*["']?([^\s"']+)/g)].map((m) => repoKey(m[1]))
+    if ([...names, ...urls].includes(key) || parseManifests(y).some((m) => manifestInRepo(m, key, connectors))) out.add(s.identifier)
   }
   return out
+}
+
+// The manifest paths of a service that live in this repo (for "changes not yet deployed")
+export function repoManifestPaths(service, key, connectors) {
+  const paths = parseManifests(service?.yaml).filter((m) => manifestInRepo(m, key, connectors)).flatMap((m) => m.paths)
+  return [...new Set(paths.map((p) => p.replace(/^\/+/, '')))].filter(Boolean)
 }
 
 // ---- The view: everything the pane, status line and tool show ----------------
@@ -161,7 +216,7 @@ export function buildView(data, scope) {
 
   // "Mine": runs built from this repo or that deployed this repo's services.
   // If the repo has no runs (or there's no repo), fall back to runs you triggered, then to the project.
-  const repoSvcs = servicesInRepo(data.services ?? [], key)
+  const repoSvcs = servicesInRepo(data.services ?? [], key, data.connectors)
   for (const x of executions) if (key && execRepoKeys(x).has(key)) for (const t of cdTargets(x)) repoSvcs.add(t.service)
   const byRepo = executions.filter((x) => (key && execRepoKeys(x).has(key)) || cdTargets(x).some((t) => repoSvcs.has(t.service)))
   const byMe = data.me ? executions.filter((x) => x?.executionTriggerInfo?.triggeredBy?.extraInfo?.email === data.me) : []
@@ -645,3 +700,88 @@ export function mcpJson(result) {
 }
 export const mcpItems = (j) => (Array.isArray(j) ? j : Array.isArray(j?.items) ? j.items : Array.isArray(j?.content) ? j.content : [])
 export const accountFromUrl = (u) => /\/account\/([^/]+)\//.exec(String(u ?? ''))?.[1] ?? ''
+
+// ---- Deployment inventory: every service × environment × infrastructure --------------------
+// Built from CD execution history (documented execution list, module=CD, paged back N days).
+// "Live" = the newest *successful* deploy stage per service/env/infra, which also covers
+// rollbacks (a failed deploy leaves the previous success live). A newer stage that is running
+// or failed is kept as the "attempt" so the pane can say "deploying 3-dev" / "3-dev failed".
+
+export function buildInventory(executions, services, environments) {
+  const svcMeta = new Map((services ?? []).map((s) => [s.identifier, s.name || s.identifier]))
+  const envMeta = new Map((environments ?? []).map((e) => [e.identifier, { name: e.name || e.identifier, type: e.type }]))
+  const cells = new Map() // svc \0 env \0 infra → { live, attempt }
+  const sorted = [...(executions ?? [])].sort((a, b) => (b.startTs || 0) - (a.startTs || 0))
+  for (const x of sorted) {
+    for (const t of cdTargets(x)) {
+      if (!t.service || !t.env) continue
+      if (!svcMeta.has(t.service)) svcMeta.set(t.service, t.serviceName || t.service)
+      if (!envMeta.has(t.env)) envMeta.set(t.env, { name: t.envName || t.env, type: t.envType })
+      const key = [t.service, t.env, t.infra || '-'].join('\u0000')
+      const c = cells.get(key) ?? { service: t.service, env: t.env, infra: t.infra || '', live: null, attempt: null }
+      const entry = {
+        artifact: t.artifact || '', status: t.status, at: t.startTs || x.startTs || 0, run: x.runSequence, pipeline: x.name ?? x.pipelineIdentifier,
+        pipelineId: x.pipelineIdentifier, execution: x.planExecutionId, by: x.executionTriggerInfo?.triggeredBy?.identifier || '',
+        commit: execCi(x)?.commit || '', url: x.openInHarness || '',
+      }
+      const k = statusKind(t.status)
+      if (k === 'ok' && !c.live) c.live = entry
+      else if (!c.live && !c.attempt && k !== 'idle') c.attempt = entry // newer than anything live
+      cells.set(key, c)
+    }
+  }
+  const envs = laneSort([...envMeta.entries()].map(([id, m]) => ({ id, ...m })))
+  const rows = [...svcMeta.entries()].map(([id, name]) => {
+    const byEnv = {}
+    for (const e of envs) {
+      const infras = [...cells.values()].filter((c) => c.service === id && c.env === e.id)
+      if (!infras.length) { byEnv[e.id] = null; continue }
+      const lives = infras.map((c) => c.live).filter(Boolean)
+      const versions = [...new Set(lives.map((l) => l.artifact || '#' + l.run))]
+      const newest = lives.sort((a, b) => b.at - a.at)[0] ?? null
+      const attempt = infras.map((c) => c.attempt).filter(Boolean).sort((a, b) => b.at - a.at)[0] ?? null
+      byEnv[e.id] = { live: newest, versions, mixed: versions.length > 1, attempt, infras }
+    }
+    // Drift: a stage running a different version than the stage before it (in lane order)
+    const drift = []
+    let prev = null
+    for (const e of envs) {
+      const c = byEnv[e.id]
+      if (!c?.live) continue
+      if (prev && e.type === 'Production' && prev.versions.join() !== c.versions.join()) drift.push({ from: prev.envName, to: e.name, toType: e.type })
+      prev = { ...c, envName: e.name }
+    }
+    const deployed = envs.some((e) => byEnv[e.id])
+    return { id, name, cells: byEnv, drift, deployed }
+  })
+  rows.sort((a, b) => (b.deployed - a.deployed) || a.name.localeCompare(b.name))
+  return { envs, rows }
+}
+
+// Merge newly fetched executions into the inventory's store, newest wins per execution id
+export function mergeRuns(store, executions) {
+  for (const x of executions ?? []) if (x?.planExecutionId && cdTargets(x).length) store.set(x.planExecutionId, x)
+  return store
+}
+
+export function inventoryCell(c, now) {
+  if (!c) return { text: '—', kind: 'idle' }
+  if (!c.live && c.attempt) return { text: `${ICON[statusKind(c.attempt.status)]} ${fit(c.attempt.artifact || '#' + c.attempt.run, 12)} ${c.attempt.status === 'Running' ? 'deploying' : c.attempt.status.toLowerCase()}`, kind: statusKind(c.attempt.status) }
+  const v = c.mixed ? `${c.versions.length} versions` : fit(c.live.artifact || '#' + c.live.run, 12)
+  const pendingKind = c.attempt ? statusKind(c.attempt.status) : null
+  const icon = pendingKind === 'run' ? '●' : pendingKind === 'fail' ? '!' : ICON.ok
+  return { text: `${icon} ${v} ${ago(c.live.at, now)}`, kind: pendingKind === 'run' ? 'run' : pendingKind === 'fail' ? 'warn' : c.mixed ? 'warn' : 'ok' }
+}
+
+export function inventoryText(inv, now, scopeLabel) {
+  const L = [`Deployments (${scopeLabel}) — live version per service and environment`]
+  const envs = inv.envs
+  L.push(['service', ...envs.map((e) => (e.type === 'Production' ? '★ ' : '') + e.name)].join(' | '))
+  for (const r of inv.rows) {
+    if (!r.deployed) continue
+    L.push([r.name, ...envs.map((e) => inventoryCell(r.cells[e.id], now).text)].join(' | ') + (r.drift.length ? `   drift: ${r.drift.map((d) => `${d.to} ≠ ${d.from}`).join(', ')}` : ''))
+  }
+  const idle = inv.rows.filter((r) => !r.deployed).map((r) => r.name)
+  if (idle.length) L.push(`Not deployed in the window: ${idle.join(', ')}`)
+  return L.join('\n')
+}

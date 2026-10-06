@@ -41,6 +41,12 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     globalFreeze: { status: 'Disabled' } as any,
     prList: [] as any[], prChecks: [] as any, prReviewers: [] as any,
     gh: null as null | { exitCode: number; stdout: string; stderr: string },
+    cdRuns: [] as any[], // the project's CD history, served 100 per page for module=CD
+    extraServices: [] as any[],
+    connector: null as null | { status: number; data?: any },
+    headTime: 0, // seconds, `git log -1 --format=%ct`
+    pending: null as null | ((since: number, paths: string[]) => number),
+    gitCalls: [] as string[],
     mcpCalls: [] as any[],
   }
   const clock = mock.clock(on, { now: T0 })
@@ -74,6 +80,12 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     if (cmd === 'git rev-parse --abbrev-ref HEAD') return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
     if (cmd === 'git rev-parse HEAD') return { value: { exitCode: 0, stdout: 'b0b0b0b0b0b0b0b0\n', stderr: '' } }
     if (cmd.startsWith('git rev-list --count') && opts.behind) return { value: { exitCode: 0, stdout: opts.behind + '\n', stderr: '' } }
+    world.gitCalls.push(cmd)
+    if (cmd === 'git log -1 --format=%ct HEAD' && world.headTime) return { value: { exitCode: 0, stdout: world.headTime + '\n', stderr: '' } }
+    if (cmd.startsWith('git rev-list --count --since=') && world.pending) {
+      const since = Number(/--since=(\d+)/.exec(cmd)![1])
+      return { value: { exitCode: 0, stdout: world.pending(since, e.argv.slice(e.argv.indexOf('--') + 1)) + '\n', stderr: '' } }
+    }
     if (cmd.startsWith('gh pr view')) return { value: world.gh ?? { exitCode: 1, stdout: '', stderr: 'no pull requests found for branch "main"' } }
     return { value: { exitCode: 1, stdout: '', stderr: 'unknown' } }
   })
@@ -82,8 +94,13 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     if (opts.slowMs) await clock.sleep(opts.slowMs)
     if (opts.httpStatus) return { value: { status: opts.httpStatus, ok: false, headers: {}, text: '' } }
     const ok = (d: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: envelope(d) } })
+    if (e.url.includes('/pipeline/api/pipelines/execution/summary') && e.url.includes('module=CD')) {
+      const page = Number(new URL(e.url).searchParams.get('page') || 0)
+      return ok({ content: world.cdRuns.slice(page * 100, page * 100 + 100) })
+    }
     if (e.url.includes('/pipeline/api/pipelines/execution/summary')) return ok({ content: world.executions })
-    if (e.url.includes('/ng/api/servicesV2')) return ok({ content: services })
+    if (e.url.includes('/ng/api/servicesV2')) return ok({ content: [...services, ...world.extraServices] })
+    if (e.url.includes('/ng/api/connectors/')) return world.connector?.status === 200 ? ok(world.connector.data) : { value: { status: world.connector?.status ?? 404, ok: false, headers: {}, text: JSON.stringify({ message: 'denied' }) } }
     if (e.url.includes('/ng/api/environmentsV2')) return ok({ content: environments })
     if (e.url.includes('/ng/api/user/currentUser')) return ok({ email: 'dev@example.com' })
     if (e.url.includes('/pipeline/api/v1/') && e.url.includes('/approvals/execution/')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(world.approvalList) } }
@@ -1023,4 +1040,245 @@ test('pull request: none open is quiet', async ($, on) => {
   const { world, clock } = harnessWorld(on, { remote: 'git@github.com:acme/bootcamp-app.git' })
   await start($, clock)
   expect(world.statuses.at(-1)).not.toContain('PR #')
+})
+
+// ---------------------------------------------------------------- deployment inventory
+
+// 250 CD runs, one every 12 h going back from now: services api/web/worker round-robin, envs dev/qa/prod
+// in blocks of three, prod api alternating between two clusters. Run 0 (api→dev) is still running;
+// run 4 (web→qa) failed on top of an older success.
+const HOUR = 3600_000
+function cdHistory() {
+  const svcs = ['api', 'web', 'worker'], envs = ['dev', 'qa', 'prod']
+  return Array.from({ length: 250 }, (_, i) => {
+    const svc = svcs[i % 3], env = envs[Math.floor(i / 3) % 3]
+    const infra = env === 'prod' && svc === 'api' ? (Math.floor(i / 3) % 2 ? 'k8s-us' : 'k8s-eu') : env + '-k8s'
+    const status = i === 0 ? 'Running' : i === 4 ? 'Failed' : 'Success'
+    const t = T0 - i * 12 * HOUR
+    return {
+      planExecutionId: 'cd' + i, pipelineIdentifier: 'deploy_' + svc, name: 'Deploy ' + svc, runSequence: 1000 - i, status, startTs: t,
+      executionTriggerInfo: { triggeredBy: { identifier: i % 2 ? 'Ana' : 'Ben' } },
+      moduleInfo: { cd: { serviceIdentifiers: [svc], envIdentifiers: [env] } },
+      layoutNodeMap: { s: { nodeType: 'Deployment', nodeGroup: 'STAGE', nodeIdentifier: 'deploy', name: 'Deploy', module: 'cd', status, startTs: t,
+        moduleInfo: { cd: { serviceInfo: { identifier: svc, displayName: svc, artifacts: { primary: { tag: `${svc}-${i}` } } },
+          infraExecutionSummary: { identifier: env, name: env, type: env === 'prod' ? 'Production' : 'PreProduction', infrastructureName: infra } } } } },
+    }
+  })
+}
+const cdReqs = (w: any) => w.requests.filter((r: any) => r.url.includes('execution/summary') && r.url.includes('module=CD'))
+
+test('inventory: no history scan until you use it', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  await clock.advance(10 * 60_000)
+  expect(cdReqs(world).length).toBe(0)
+})
+
+test('inventory: scans CD history 100 at a time and stops at the window (90 days)', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  const r = cdReqs(world)
+  expect(r.map((x: any) => new URL(x.url).searchParams.get('page'))).toEqual(['0', '1']) // page 1 reaches past 90 days
+  expect(r[0].url).toContain('size=100')
+  expect(JSON.parse(r[0].init.body)).toEqual({ filterType: 'PipelineExecution' })
+})
+
+test('inventory: every service × environment with the live version, in-flight and failed deploys, drift', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS \(whole project\) · 4 services × 3 environments ─+$/ })).toBeDefined()
+  // api→dev: run 0 still deploying; run 9 (4.5 days ago) is what's live
+  expect(await ui.find({ type: 'Text', text: /^● api-9 4d/ })).toBeDefined()
+  // web→qa: run 4 failed on top of run 13 (6.5 days ago), which stays live
+  expect(await ui.find({ type: 'Text', text: /^! web-13 6d/ })).toBeDefined()
+  // api→prod: two clusters on different versions, and prod differs from qa
+  expect(await ui.find({ type: 'Text', text: /^✓ 2 versions 3d/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '⚠ prod ≠ qa' })).toBeDefined() // drift = prod differs from the stage before it
+  expect(await ui.find({ type: 'Text', text: 'not deployed in 90 days: guestflow-api' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'live = last good deploy per environment/infrastructure · 200 CD runs · 90d · scanned now' })).toBeDefined()
+  // 1 narrows the inventory to this repo's services
+  await ui.press({ key: 'scope-mine' })
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS \(this repo\) · 1 services/ })).toBeDefined()
+})
+
+test('inventory: e opens a service down to each infrastructure: version, when, who, which run', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'inv-expand' }) // first row: api
+  expect(await ui.find({ type: 'Text', text: /^★ prod · k8s-eu/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^★ prod · k8s-us/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^api-6 / })).toBeDefined() // run 6: eu cluster, 3 days ago
+  expect(await ui.find({ type: 'Text', text: '3d ago by Ben · Deploy api #994' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^    │   ↳ newer: api-0 Running just now \(Deploy api #1000\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    │ ⚠ prod runs a different version from qa' })).toBeDefined()
+  await ui.press({ key: 'inv-back' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+})
+
+test('inventory: text and tool for headless and for Claude', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'inventory' })
+  expect(out.text.split('\n')[0]).toBe('Deployments (whole project) — live version per service and environment')
+  expect(out.text).toContain('service | dev | qa | ★ prod')
+  expect(out.text).toMatch(/\napi \| ● api-9 4d \| ✓ api-3 1d \| ✓ 2 versions 3d   drift: prod ≠ qa/)
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL, view: 'inventory' })) as any).result)
+  const api = s.services.find((x: any) => x.service === 'api')
+  expect(api.environments.prod.infrastructures).toEqual([{ infra: 'k8s-eu', version: 'api-6' }, { infra: 'k8s-us', version: 'api-15' }])
+  expect(api.environments.dev.newer_attempt).toMatchObject({ version: 'api-0', status: 'Running' })
+  expect(api.drift).toEqual(['prod differs from qa'])
+})
+
+test('inventory in sign-in mode: the same scan through harness_list with module CD', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, surfaces: [], mcp: (t, a) => (t === 'harness_list' && a.resource_type === 'execution' && a.filters?.module === 'CD') ? { items: w.cdRuns.slice(a.page * 100, a.page * 100 + 100) } : mcpHarness(w)(t, a) })
+  w = world
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'inventory' })
+  expect(out.text).toContain('web | ✓ web-1')
+  const scans = world.mcpCalls.filter((c: any) => c.args?.filters?.module === 'CD')
+  expect(scans.map((c: any) => c.args.page)).toEqual([0, 1])
+})
+
+// ---------------------------------------------------------------- CD-only repos (manifests here, no build)
+
+const PAYMENTS_YAML = `service:
+  name: payments
+  identifier: payments
+  serviceDefinition:
+    type: Kubernetes
+    spec:
+      manifests:
+        - manifest:
+            identifier: k8s
+            type: K8sManifest
+            spec:
+              store:
+                type: Github
+                spec:
+                  connectorRef: org.gh_payments
+                  gitFetchType: Branch
+                  branch: main
+                  paths:
+                    - deploy/k8s
+                    - deploy/values.yaml
+      artifacts:
+        primary:
+          spec:
+            connectorRef: docker_hub
+`
+const payDeploy = (id: string, run: number, env: string, status: string, t: number, tag: string) => ({
+  planExecutionId: id, pipelineIdentifier: 'deploy_payments', name: 'Deploy payments', runSequence: run, status, startTs: t,
+  executionTriggerInfo: { triggeredBy: { identifier: 'Ana' } },
+  moduleInfo: { cd: { serviceIdentifiers: ['payments'], envIdentifiers: [env] } }, // no CI module: deploy-only
+  layoutNodeMap: { s: { nodeType: 'Deployment', nodeGroup: 'STAGE', nodeIdentifier: 'Deploy_' + env, name: 'Deploy ' + env, module: 'cd', status, startTs: t,
+    failureInfo: { message: status === 'Failed' ? 'Deployment did not stabilize in 10m' : '' },
+    moduleInfo: { cd: { serviceInfo: { identifier: 'payments', displayName: 'payments', artifacts: { primary: { tag } } },
+      infraExecutionSummary: { identifier: env, name: env, type: env === 'prod' ? 'Production' : 'PreProduction', infrastructureName: env + '-k8s' } } } } },
+})
+// dev deployed 2 days ago, prod 5 days ago; 3 commits touched the manifests since prod's deploy, none since dev's
+function cdOnlyWorld(on: any, opts: any = {}) {
+  const r = harnessWorld(on, { remote: 'git@github.com:acme/payments.git', ...opts })
+  const w = r.world
+  w.extraServices = [{ identifier: 'payments', name: 'payments', yaml: PAYMENTS_YAML }]
+  w.connector = { status: 200, data: { connector: { type: 'Github', spec: { url: 'git@github.com:acme/payments.git', type: 'Repo' } } } }
+  w.executions = [payDeploy('p11', 11, 'dev', 'Success', T0 - 2 * 86400_000, 'pay-11'), payDeploy('p9', 9, 'prod', 'Success', T0 - 5 * 86400_000, 'pay-9'), ...w.executions]
+  w.headTime = Math.floor((T0 - 2 * HOUR) / 1000)
+  w.pending = (since: number) => (since < Math.floor((T0 - 3 * 86400_000) / 1000) ? 3 : 0)
+  return r
+}
+
+test('CD-only: a repository-level connector ties the service to this repo', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { surfaces: [] })
+  await start($, clock)
+  const c = reqs(world, '/ng/api/connectors/gh_payments')
+  expect(c.length).toBe(1)
+  expect(c[0].url).toContain('orgIdentifier=ORG')
+  expect(c[0].url).not.toContain('projectIdentifier') // org-scoped connector
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out.text).toContain('Harness ORG/proj — this repo')
+  expect(out.text).toContain('Deploy payments #11 Success 2d — payments→dev')
+  expect(out.text).not.toContain('CI CD #') // the other repo's runs are not "this repo"
+})
+
+test('CD-only: manifest changes not yet deployed, per environment', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on)
+  await start($, clock)
+  const revs = world.gitCalls.filter((x: string) => x.startsWith('git rev-list --count --since='))
+  expect(revs.length).toBe(2) // dev and prod
+  expect(revs[0]).toMatch(/ HEAD -- deploy\/k8s deploy\/values\.yaml$/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^CD-only: deploys payments from manifests here/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^up to date · 2d/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^3 changes pending · 5d/ })).toBeDefined()
+  expect(world.statuses.at(-1)).toBe('harness: main@b0b0b0b CD-only · prod 3 pending') // not "not built"
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.cd_only_repo).toBe(true)
+  expect(s.manifest_changes_pending).toEqual({ 'payments→dev': 0, 'payments→prod': 3 })
+})
+
+test('CD-only: the inventory says which environments are missing your manifest changes', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'scope-mine' })
+  await ui.press({ key: 'inv-expand' })
+  expect(await ui.find({ type: 'Text', text: '    │   manifests in this repo: 3 commits since this deploy, not deployed yet' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    │   manifests in this repo: no changes since this deploy' })).toBeDefined()
+})
+
+test('CD-only push guard: holds the push while the last deploy of this repo\'s service is failing', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: "Don't push" })
+  world.executions.unshift(payDeploy('p12', 12, 'prod', 'Failed', T0 - HOUR, 'pay-12'))
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(world.asked[0]).toBe('Claude wants to push, but the last deploy of payments to prod failed in Harness (Deploy payments #12: Deploy prod: Deployment did not stabilize in 10m). Push anyway?')
+  expect(out.deny).toMatch(/^The user chose not to push yet: the last deploy of payments to prod failed/)
+})
+
+test('CD-only failure flow: a deploy after your manifest change fails → diagnosis → fix aimed at the manifests', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: 'Let Claude fix it' })
+  await start($, clock)
+  world.executions.unshift(payDeploy('p13', 13, 'prod', 'Failed', T0 + 30_000, 'pay-13')) // after HEAD (2 h ago)
+  await clock.advance(65_000); await clock.settle()
+  expect(world.asked[0]).toMatch(/^Deploy payments #13 failed deploying payments to prod after your latest manifest change: Pod taskmanager OOMKilled.*What now\?$/)
+  expect(world.prompts[0]).toContain('This repo holds the deployment manifests (no build in Harness): deploy/k8s, deploy/values.yaml.')
+})
+
+test('CD-only: a deploy that started before your latest commit is not "yours"', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: 'Ignore' })
+  world.headTime = Math.floor((T0 + 10 * 60_000) / 1000) // you committed after the deploy started
+  await start($, clock)
+  world.executions.unshift(payDeploy('p13', 13, 'prod', 'Failed', T0 + 30_000, 'pay-13'))
+  await clock.advance(65_000); await clock.settle()
+  expect(world.asked.length).toBe(0)
+})
+
+test('CD-only without permission to read the connector: doctor says what it costs', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { surfaces: [] })
+  world.connector = { status: 403 }
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toContain("✗ Git connectors — 0/1 readable; can't read org.gh_payments (needs view on connectors), so services using them can't be matched to this repo")
+})
+
+test('CD-only doctor: names the services and the mode', async ($, on) => {
+  const { clock } = cdOnlyWorld(on, { surfaces: [] })
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toContain('✓ Git connectors — 1 read to match service manifests to this repo')
+  expect(out.text).toContain('✓ Services from this repo — payments — CD-only repo: matched by manifests; pending manifest changes tracked per environment')
 })

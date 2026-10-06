@@ -11,6 +11,10 @@ A Claude Code mod (plugin) that gives you one pane for Harness, scoped to the re
 
 Also: a status line under the prompt, toasts when your runs finish/fail/wait for approval, 10-second polling for 15 minutes after Claude runs `git push`, and a `harness_status` tool Claude can call.
 
+New in 0.8:
+- **Deployment inventory** (`i`, `/harness inventory`): every service × environment × infrastructure in the project with the version live there (last successful deploy, from 90 days of CD history), newer running or failed deploys, split versions, and production drift. `e` opens a service down to each cluster: version, when, who, which run.
+- **CD-only repos** (manifests here, no build in Harness): matched through the service's manifest store, including **repository-level Git connectors** (the connector's URL is read); **manifest changes not yet deployed** per environment; the push guard and "your change failed" work from deploys; the status line says "CD-only" instead of "not built".
+
 New in 0.7:
 - **`/harness doctor`:** read-only checks of every API the plugin uses (runs, services, environments, step details, logs, approvals, freeze windows, runtime inputs per pipeline, pull requests), each with a ✓ / ✗ / · verdict and what to do.
 - **Runtime inputs:** rerun and retry resend the inputs the original run used; if none were recorded, the pipeline's runtime inputs are asked one by one (defaults and allowed values offered). More than six: it hands off to Harness or Claude instead.
@@ -108,5 +112,5 @@ Terminal and the Desktop app's Code tab draw the pane. In `claude -p` and the VS
 
 ```bash
 claude plugin validate .   # static check: events hooked, API calls made
-claude plugin test         # 95 tests, no network or sign-in needed
+claude plugin test         # 110 tests, no network or sign-in needed
 ```

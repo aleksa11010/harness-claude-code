@@ -207,3 +207,17 @@ test('repo hosts and MCP results', () => {
   expect(mcpJson({ content: [{ type: 'text', text: '{"items":[1]}' }], isError: false })).toEqual({ items: [1] })
   expect(() => mcpJson({ content: [{ type: 'text', text: 'denied' }], isError: true })).toThrow('denied')
 })
+
+import { parseManifests, connectorScope, manifestInRepo, repoManifestPaths } from '../hooks/lib.js'
+
+test('manifests: Git and Harness Code stores, list and folder paths, artifacts ignored', () => {
+  const y = 'service:\n  serviceDefinition:\n    spec:\n      manifests:\n        - manifest:\n            spec:\n              store:\n                type: Github\n                spec:\n                  connectorRef: account.gh\n                  repoName: payments\n                  paths:\n                    - k8s/\n        - manifest:\n            spec:\n              store:\n                type: HarnessCode\n                spec:\n                  repoName: charts\n                  folderPath: charts/payments\n                  valuesPaths:\n                    - <+env.name>/values.yaml\n      artifacts:\n        primary:\n          spec:\n            connectorRef: docker'
+  const m = parseManifests(y)
+  expect(m.map((x: any) => [x.storeType, x.connectorRef, x.repoName, x.paths.join(',')])).toEqual([['Github', 'account.gh', 'payments', 'k8s/'], ['HarnessCode', '', 'charts', 'charts/payments']])
+  expect(connectorScope('account.gh')).toEqual({ id: 'gh', scope: 'account' })
+  // an account-level connector matches through repoName; a repo-level one through its URL
+  expect(manifestInRepo(m[0], 'payments', new Map([['account.gh', { url: 'https://github.com/acme', type: 'Account' }]]))).toBe(true)
+  expect(manifestInRepo({ connectorRef: 'r', repoName: '', paths: [] }, 'payments', new Map([['r', { url: 'https://github.com/acme/payments.git', type: 'Repo' }]]))).toBe(true)
+  expect(manifestInRepo({ connectorRef: 'r', repoName: '', paths: [] }, 'payments', new Map())).toBe(false) // unknown connector: no guess
+  expect(repoManifestPaths({ yaml: y }, 'charts', new Map())).toEqual(['charts/payments']) // runtime-expression paths skipped
+})

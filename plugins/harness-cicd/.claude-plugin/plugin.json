@@ -1,7 +1,7 @@
 {
   "name": "harness-cicd",
   "displayName": "Harness CI/CD",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Single pane of glass for Harness in Claude Code: your branch's builds, pipeline runs, what's deployed where, and environments",
   "author": {
     "name": "Your Team"
@@ -159,6 +159,22 @@
       "title": "Harness MCP server (sign-in mode)",
       "description": "The server to use when there's no API key, as /mcp lists it",
       "default": "plugin:harness-cicd:harness"
+    },
+    "inventory_days": {
+      "type": "number",
+      "title": "Inventory history (days)",
+      "description": "How far back the deployment inventory looks for each service's live version",
+      "default": 90,
+      "min": 7,
+      "max": 365
+    },
+    "inventory_max_runs": {
+      "type": "number",
+      "title": "Inventory runs to scan",
+      "description": "Upper bound of CD runs read per inventory scan (100 per request)",
+      "default": 500,
+      "min": 100,
+      "max": 2000
     }
   },
   "mcpServers": {

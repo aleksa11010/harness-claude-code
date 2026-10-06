@@ -15,6 +15,7 @@ It's a Claude Code **mod**: a plugin with JavaScript hooks that draws its own in
 - [Failure diagnosis](#failure-diagnosis)
 - [Acting on runs](#acting-on-runs)
 - [Approvals](#approvals)
+- [Deployment inventory](#deployment-inventory)
 - [When your build fails](#when-your-build-fails)
 - [Guardrails](#guardrails)
 - [Layouts](#layouts)
@@ -23,6 +24,7 @@ It's a Claude Code **mod**: a plugin with JavaScript hooks that draws its own in
 - [What Claude sees](#what-claude-sees)
 - [`/harness doctor`](#harness-doctor)
 - [Outside the terminal: text mode](#outside-the-terminal-text-mode)
+- [Which repo? How your checkout connects to Harness](#which-repo-how-your-checkout-connects-to-harness)
 - [Installing](#installing)
 - [Connecting to Harness](#connecting-to-harness)
 - [Reference: commands, keys, settings](#reference-commands-keys-settings)
@@ -37,13 +39,13 @@ It's a Claude Code **mod**: a plugin with JavaScript hooks that draws its own in
 
 ## Quick start
 
-You need **Claude Code v2.1.287 or later** (`claude --version`) and access to a Harness project.
+You need **Claude Code v2.1.287 or later** (`claude --version`), access to a Harness project, and a git checkout of a repo that project builds or deploys (see [Which repo?](#which-repo-how-your-checkout-connects-to-harness)).
 
 ```bash
 # 1. Get the plugin
-git clone https://git.harness.io/8INL1LHjRmmrZQKdYtlvKA/default/Playground_Aleksa/harness-tools.git
+git clone https://github.com/aleksa11010/harness-claude-code.git
 # 2. Install it (asks for your org, project, layout, and an API key or "sign in instead")
-./harness-tools/install.sh
+./harness-claude-code/install.sh
 # 3. Open Claude Code in a repo Harness builds, and type
 /harness
 ```
@@ -63,7 +65,7 @@ From top to bottom:
 | Section | What it shows |
 |---|---|
 | **Header** | The Harness org/project, when it last refreshed, and badges such as an active freeze or "auto-fix on". |
-| **Controls** | `1` **This repo** / `2` **Whole project**, `r` **Refresh**, `v` **Layout**, and a link to the project in Harness. |
+| **Controls** | `1` **This repo** / `2` **Whole project**, `r` **Refresh**, `i` **[Inventory](#deployment-inventory)**, `v` **Layout**, and a link to the project in Harness. |
 | **This branch** | Your repo, branch and HEAD commit; whether *that exact commit* has been built, and the result; how far production is behind HEAD; the branch's open pull request. |
 | **Approvals waiting** | Appears when any run in the project waits for an approval (see [Approvals](#approvals)). |
 | **Pipelines** | Recent runs: status, what each built (`branch@commit`) or deployed (`service→environment`), and age. `❯` marks the selected run; failed runs open into a [diagnosis card](#failure-diagnosis). |
@@ -71,7 +73,7 @@ From top to bottom:
 | **Environments** | Every environment in the project. |
 | **Hints** | The keys that apply to the selected run. |
 
-**"This repo" is matched automatically.** The plugin reads your git `origin` and matches it against each run's repository, so you see the runs that built *this* code and the services whose manifests live in it. If nothing matches, it falls back to runs you triggered, then to the whole project, and says so.
+**"This repo" is matched automatically.** The plugin reads your git `origin` and matches it against each run's repository, so you see the runs that built *this* code and the services whose manifests live in it, including repos Harness only deploys from ([details](#which-repo-how-your-checkout-connects-to-harness)). If nothing matches, it falls back to runs you triggered, then to the whole project, and says so.
 
 ---
 
@@ -145,6 +147,35 @@ This lets CI CD #3 deploy to production (prod). Approve it?  → Yes, approve fo
 ```
 
 **Reject** asks once. Jira, ServiceNow and custom approvals are shown with where to decide them; Harness's API can approve only Harness Approval steps. Approving and rejecting need `allow_actions`.
+
+---
+
+## Deployment inventory
+
+Press `i` (or `/harness inventory`) for the single view of the whole project: **every service, in every environment, with the version live there.**
+
+![The deployment inventory: every service × environment with its live version](docs/images/inventory.png)
+
+Each cell is the version live in that environment, and how long ago it went out:
+
+| Cell | Means |
+|---|---|
+| `✓ api-3 1d` | `api-3` is live, deployed a day ago |
+| `● api-9 4d` | `api-9` is live, and a newer deploy is running right now |
+| `! web-13 6d` | `web-13` is live, but a newer deploy failed (so `web-13` stayed) |
+| `✗ v3 failed` | nothing has deployed successfully here; the last attempt failed |
+| `2 versions` | the environment's clusters run different versions |
+| `⚠ prod ≠ qa` | production runs a different version from the stage before it |
+
+Services with no deploys in the window are listed underneath. `1` narrows the view to this repo's services; `2` goes back to the whole project.
+
+Select a service with `j` / `k` and press `e` for every environment and infrastructure: the live version, when, who deployed it, which run (with a link), any newer attempt, and, for services whose manifests live in your repo, changes not yet deployed:
+
+![One service opened: each environment and cluster with version, time, deployer and run](docs/images/inventory-detail.png)
+
+**How "live" is worked out.** The plugin reads the project's CD history: Harness's documented execution list, 100 runs at a time, going back 90 days (`inventory_days`, up to `inventory_max_runs`). For each service, environment and infrastructure, the newest **successful** deploy is what's live. That also covers rollbacks: a failed deploy leaves the previous version in place. The scan runs only while you use the inventory, and repeats every 10 minutes; recent runs are merged in on every refresh. Claude can read the same inventory through `harness_status` with `view: "inventory"`.
+
+It reflects what Harness deployed, not what a cluster reports. Changes made outside Harness (for example `kubectl` by hand) and instance counts aren't shown; see [Known limitations](#known-limitations).
 
 ---
 
@@ -310,12 +341,41 @@ The tool, context, guardrails and toasts work everywhere hooks run.
 
 ---
 
+## Which repo? How your checkout connects to Harness
+
+The plugin doesn't connect to your repo itself. It reads your local checkout (the `origin` remote, branch and HEAD) and matches it against what Harness records. Two kinds of repo are recognized:
+
+**Repos Harness builds.** A pipeline's Build stage clones the repo as its *codebase*, so every run records repo, branch and commit. This powers everything, including *This branch*, *is HEAD built?* and *commits behind prod*. In Harness: a Build stage with **Clone Codebase** on, pointing at the repo (Harness Code needs no connector; GitHub, GitLab and Bitbucket use a Git connector with API access), plus a push or PR trigger so pushes start runs.
+
+**Repos Harness only deploys from (CD-only).** No build stage, but a service's **manifests** live in the repo. The plugin reads each service's manifest store and matches the repo by `repoName`, or, for **repository-level Git connectors**, by reading the connector's URL. A CD-only repo gets:
+
+![A CD-only repo: its service's deploys, and manifest changes not yet deployed per environment](docs/images/cd-only.png)
+
+- its services' deploys as "this repo", the lanes and the inventory;
+- **manifest changes not yet deployed**: commits on your branch that touched the service's manifest paths since each environment's last good deploy (`3 changes pending`), also in the status line;
+- the **push guard**, holding a push while the last deploy of one of its services is failing;
+- **"your change failed"**: when a deploy that started after your latest commit fails, you get the diagnosis and the offer to let Claude fix it, aimed at the manifests.
+
+What each feature needs:
+
+| Feature | Needs |
+|---|---|
+| "This repo", runs, lanes, inventory | a pipeline building the repo, **or** services whose manifests live in it |
+| This branch, is HEAD built, commits behind prod | a pipeline building the repo (runs carry branch and commit) |
+| Manifest changes not yet deployed | services whose manifests live in the repo |
+| Pull request | Harness Code (with an API key), or GitHub with `gh` |
+| Approvals, freezes, whole-project view | nothing repo-specific |
+
+**Check it:** `/harness doctor` shows `✓ Pipeline runs — N recent runs, M from this repo` and, for CD-only repos, `✓ Services from this repo — … CD-only repo`. If the repo isn't recognized: set `repo_name` when your remote's name differs from Harness's (forks, mirrors); give your key view access to connectors if the doctor says it can't read them.
+
+---
+
 ## Installing
 
 ### With the installer (macOS / Linux)
 
 ```bash
-./harness-tools/install.sh
+./harness-claude-code/install.sh
 ```
 
 It asks for your org ID, project ID, Harness URL, layout, whether to allow write actions (default no), and your API key (hidden; press Enter to sign in with Harness instead). Then it:
@@ -329,7 +389,7 @@ It asks for your org ID, project ID, Harness URL, layout, whether to allow write
 Re-run it any time to update or change settings; press Enter at the key prompt to keep the saved key. Non-interactive:
 
 ```bash
-HARNESS_API_KEY=… HARNESS_DEFAULT_ORG_ID=default HARNESS_DEFAULT_PROJECT_ID=Playground_Aleksa ./harness-tools/install.sh --yes
+HARNESS_API_KEY=… HARNESS_DEFAULT_ORG_ID=YOUR_ORG HARNESS_DEFAULT_PROJECT_ID=YOUR_PROJECT ./harness-claude-code/install.sh --yes
 ```
 
 It uses no `sudo` and changes nothing outside `~/.claude-plugins` and Claude Code's own settings.
@@ -337,8 +397,8 @@ It uses no `sudo` and changes nothing outside `~/.claude-plugins` and Claude Cod
 ### From the repo, without the installer (any OS, including Windows)
 
 ```bash
-claude plugin marketplace add https://git.harness.io/8INL1LHjRmmrZQKdYtlvKA/default/Playground_Aleksa/harness-tools.git
-claude plugin install harness-cicd@harness-tools --config org_id=default --config project_id=Playground_Aleksa
+claude plugin marketplace add aleksa11010/harness-claude-code
+claude plugin install harness-cicd@harness-tools --config org_id=YOUR_ORG --config project_id=YOUR_PROJECT
 ```
 
 Then in Claude Code, either `/plugin configure harness-cicd@harness-tools` to paste an API key, or `/mcp` → **plugin:harness-cicd:harness** → **Authenticate**.
@@ -346,8 +406,8 @@ Then in Claude Code, either `/plugin configure harness-cicd@harness-tools` to pa
 ### Trying it without installing
 
 ```bash
-export HARNESS_API_KEY=pat.…  HARNESS_DEFAULT_ORG_ID=default  HARNESS_DEFAULT_PROJECT_ID=Playground_Aleksa
-claude --plugin-dir ./harness-tools/plugins/harness-cicd
+export HARNESS_API_KEY=pat.…  HARNESS_DEFAULT_ORG_ID=YOUR_ORG  HARNESS_DEFAULT_PROJECT_ID=YOUR_PROJECT
+claude --plugin-dir ./harness-claude-code/plugins/harness-cicd
 ```
 
 ### Updating and removing
@@ -387,6 +447,7 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 | `/harness all` · `/harness mine` | open on the whole project / this repo |
 | `/harness refresh` | refresh now |
 | `/harness doctor` | read-only checks of everything |
+| `/harness inventory` | every service × environment with its live version |
 | `/harness diagnose [run id]` | diagnose the latest failed run, or that one |
 | `/harness layout <stacked\|focus\|dock\|strip>` | switch layout |
 | `/harness autofix on\|off` | switch "when your build fails" between auto and ask |
@@ -396,7 +457,8 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 | Key | | Key | |
 |---|---|---|---|
 | `1` / `2` | this repo / whole project | `a` | actions for the selected run |
-| `r` | refresh | `e` | expand / collapse the diagnosis card |
+| `r` | refresh | `e` | expand / collapse the diagnosis card (inventory: service details) |
+| `i` | inventory / back to runs | | |
 | `v` | next layout | `f` | fix with Claude |
 | `j` / `k` | select next / previous run | `d` | diagnose |
 | `w` | switch tab (dock layout) | `q` | close the actions menu |
@@ -428,6 +490,8 @@ Set them in the installer, `/plugin configure harness-cicd@harness-tools`, or `-
 | `add_context` | `true` | one line of Harness state on CI/deploy prompts |
 | `poll_seconds` | `60` | 15–600; 10 s while watching a push |
 | `max_runs` | `50` | 10–100 recent runs per refresh |
+| `inventory_days` | `90` | 7–365 days of deploy history for the inventory |
+| `inventory_max_runs` | `500` | 100–2000 CD runs per inventory scan |
 | `skip_user_lookup` | `false` | for service-account keys |
 | `mcp_server` | `plugin:harness-cicd:harness` | the Harness MCP server for sign-in mode |
 
@@ -457,6 +521,8 @@ The plugin is one hooks module (`hooks/register.js`) plus pure logic (`hooks/lib
 | approvals | each refresh, for up to 5 runs that are waiting on one |
 | freeze windows | every 5 minutes |
 | pull request | every 2 minutes |
+| deployment inventory | every 10 minutes, only while you use it |
+| Git connectors (CD-only repos) | every 30 minutes |
 | git branch and HEAD | each refresh, locally |
 
 Hooks it uses: `session.start`, `command.run`, `tool.call` (its own tool, Bash for the push guard, Harness MCP tools for the production guard), `prompt.submit` (context), and `ui.render` (the pane and the band).
@@ -470,6 +536,9 @@ Read, on every refresh:
 - `GET /ng/api/user/currentUser` (once)
 
 Read, when needed:
+
+- for the inventory: `POST /pipeline/api/pipelines/execution/summary?module=CD` (100 per page, back `inventory_days`)
+- for CD-only repos: `GET /ng/api/connectors/{id}` (the Git connector behind a service's manifests, every 30 minutes)
 
 - `GET /pipeline/api/v1/orgs/{org}/projects/{project}/approvals/execution/{id}?approval_status=WAITING`
 - `GET /ng/api/freeze/getGlobalFreeze`, `POST /ng/api/freeze/list`
@@ -508,7 +577,8 @@ Start with `/harness doctor`; every ✗ line says what's wrong and what still wo
 | `harness: not configured` | no project ID | set `project_id` (and sign in or set a key) |
 | `Harness refused the API key (HTTP 401)` | key wrong, expired, or for another account | create a new key; re-run the installer |
 | `Harness sign-in needed: run /mcp …` | sign-in mode, not signed in yet | `/mcp` → **plugin:harness-cicd:harness** → **Authenticate** |
-| `No runs found for repo "x"` | your git remote name differs from Harness's | set `repo_name` |
+| `No runs found for repo "x"` | no pipeline builds this repo and no service's manifests are in it, or the names differ | see [Which repo?](#which-repo-how-your-checkout-connects-to-harness); set `repo_name` |
+| `✗ Git connectors — can't read …` | the key can't view the connector behind a service's manifests | grant view on connectors |
 | Actions greyed out "(off: allow_actions)" | write actions are off | turn on `allow_actions` |
 | `User not authorized to approve/reject` | you're not in the approval's user groups | ask an approver; the pane shows who |
 | `✗ Freeze windows — could not read them` | no view permission on freeze windows | grant it; production actions aren't freeze-checked until then |
@@ -527,9 +597,10 @@ claude -p "/harness doctor" --debug-to-stderr 2>&1 | grep harness-cicd
 ## Developing the plugin
 
 ```text
-harness-tools/
-├── .claude-plugin/marketplace.json     the marketplace (one plugin)
-├── .harness/harness-cicd-ci.yaml       CI pipeline (Harness Cloud)
+harness-claude-code/
+├── .claude-plugin/marketplace.json     the marketplace "harness-tools" (one plugin)
+├── .github/workflows/ci.yml            CI on GitHub Actions
+├── .harness/harness-cicd-ci.yaml       the same CI as a Harness pipeline
 ├── install.sh                          installer
 ├── docs/images/                        screenshots for this README
 └── plugins/harness-cicd/
@@ -537,21 +608,21 @@ harness-tools/
     ├── hooks/hooks.json                points to the hooks module
     ├── hooks/register.js               hooks, Harness calls, rendering
     ├── hooks/lib.js                    pure logic: parsing, matching, diagnosis prompts, guards
-    └── tests/                          95 tests (claude plugin test)
+    └── tests/                          110 tests (claude plugin test)
 ```
 
 ```bash
 cd plugins/harness-cicd
 claude plugin validate --strict ../..   # manifest, hooks, and every API the mod calls
-claude plugin test                      # 95 tests, no network or sign-in needed
+claude plugin test                      # 110 tests, no network or sign-in needed
 claude --plugin-dir .                   # try your changes in a real session
 ```
 
 The tests drive the plugin through Claude Code's mod test kit: they stub Harness with responses shaped like the real APIs, press keys in the pane, answer its questions, and check what it draws and what it sends.
 
-**CI.** The pipeline **harness-cicd plugin CI** (`harness_cicd_plugin_ci` in default / Playground_Aleksa) runs `claude plugin validate --strict` and `claude plugin test` on Harness Cloud. The trigger **On push to main** runs it on every push to `main`.
+**CI.** Every push and pull request runs `claude plugin validate --strict` and `claude plugin test` on GitHub Actions (`.github/workflows/ci.yml`). The same checks exist as a Harness pipeline, **harness-cicd plugin CI** (`.harness/harness-cicd-ci.yaml`), triggered by pushes to the Harness Code mirror.
 
-**Releasing.** Bump `version` in `plugins/harness-cicd/.claude-plugin/plugin.json`, push to `main`, wait for green. Teammates then run `claude plugin update harness-cicd@harness-tools`.
+**Releasing.** Bump `version` in `plugins/harness-cicd/.claude-plugin/plugin.json`, push to `main`, wait for green. Teammates then run `claude plugin marketplace update harness-tools && claude plugin update harness-cicd@harness-tools`.
 
 ---
 
@@ -559,7 +630,8 @@ The tests drive the plugin through Claude Code's mod test kit: they stub Harness
 
 - **Tested against documented shapes, not every account.** Paths verified only against Harness's documented API shapes so far: step-level details and logs, approval details, write actions with runtime inputs, and sign-in mode after authentication. The doctor tells you which work in your account.
 - **One project at a time** (switch with `project_id`).
-- **Last deployment, not live state.** The deployed view shows the last deployments in recent runs (`max_runs`), not what's live in the cluster.
+- **Inventory = what Harness deployed.** "Live" is the last successful deploy per environment and infrastructure in the last 90 days. Harness's instance counts (from its instance sync) aren't shown: they come from internal endpoints outside the public API. Changes made outside Harness aren't seen.
+- **Manifest changes are counted by commit time** since each deploy; a commit made earlier but pushed later can be missed.
 - **Harness Code pull requests need an API key**; GitHub works in both modes via `gh`.
 - **No log viewer.** Diagnosis reads logs for you; for the full log use **open in Harness**.
 - **Polling, not push**: changes appear within the poll interval.
