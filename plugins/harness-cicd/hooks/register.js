@@ -344,7 +344,8 @@ async function decideApproval($, x, a, action) {
   }
   const inputs = []
   try {
-    if ((await $.ui.ask(`${verb} ${name}${a.message ? `: "${fit(a.message.replace(/\s+/g, ' '), 100)}"` : ''}?`, [verb, 'Cancel'])) !== verb) return
+    const msg = fit(a.message.replace(/\s+/g, ' ').replace(/[?.!\s]+$/, ''), 100) // the question adds its own "?"
+    if ((await $.ui.ask(`${verb} ${name}${msg ? `: "${msg}"` : ''}?`, [verb, 'Cancel'])) !== verb) return
     if (action === 'APPROVE') {
       for (const i of a.inputs.slice(0, 5)) {
         // Pick the default, or type a value under "Other"
@@ -533,7 +534,9 @@ function notify($) {
     parts.push(`${v.branch.name}@${short(v.branch.head)} ${h ? ICON[statusKind(h.status)] + ' ' + h.status : 'not built'}`)
   }
   if (v.counts.running) parts.push(`${v.counts.running} running`)
-  if (v.counts.waiting) parts.push(`${v.counts.waiting} waiting`)
+  // Runs waiting on an approval are counted once, as approvals (below)
+  const otherWaiting = v.executions.filter((x) => statusKind(x.status) === 'wait' && !isApprovalWaiting(x)).length
+  if (otherWaiting) parts.push(`${otherWaiting} waiting`)
   if (v.counts.failed) parts.push(`${v.counts.failed} failed`)
   if (pr) { const c = summarizeChecks(pr.checks); parts.push(`PR #${pr.number} ${c.fail ? `✗ ${c.fail} failing` : c.run ? '● checks' : '✓'}`) }
   if (freeze?.frozen) parts.unshift(freezeText(freeze))
@@ -958,11 +961,14 @@ function renderPane($, el, props, now) {
   const T = mkT(el.Text)
   const W = Math.max(40, Number(props.bodyColumns) || 80) - 2
   const docked = props.placement === 'dock'
+  const narrow = W < 70
+  const right = `${freeze?.frozen ? freezeText(freeze) + ' · ' : ''}${cfg.on_failure === 'auto' ? 'auto-fix on · ' : ''}` +
+    (error === 'not configured' ? 'setup needed' : updatedAt ? `${narrow ? '' : 'updated '}${ago(updatedAt, now)}${now < burstUntil ? ' · watching' : ''}` : 'loading…')
   const header = Box({
     flexDirection: 'row', justifyContent: 'space-between',
     children: [
-      T(fit(`Harness · ${cfg.org_id}/${cfg.project_id}`, W - 40), { bold: true }),
-      T(`${freeze?.frozen ? freezeText(freeze) + ' · ' : ''}${cfg.on_failure === 'auto' ? 'auto-fix on · ' : ''}${updatedAt ? `updated ${ago(updatedAt, now)}${now < burstUntil ? ' · watching' : ''}` : 'loading…'}`, { dimColor: true }),
+      T(fit(`Harness · ${cfg.org_id}/${cfg.project_id}`, Math.max(12, W - Array.from(right).length - 2)), { bold: true }),
+      T(right, { dimColor: true }),
     ],
   })
   if (error === 'not configured') {
@@ -989,13 +995,14 @@ function renderPane($, el, props, now) {
   const redraw = () => $.ui.invalidate('ui.render')
 
   const controls = Box({
-    flexDirection: 'row', columnGap: 3,
+    flexDirection: 'row', columnGap: narrow ? 2 : 3,
     children: [
-      Button({ key: 'scope-mine', label: 'This repo', hotkey: '1', plain: true, dimColor: scope !== 'mine', onPress: () => { scope = 'mine'; redraw() } }),
-      Button({ key: 'scope-all', label: 'Whole project', hotkey: '2', plain: true, dimColor: scope !== 'all', onPress: () => { scope = 'all'; redraw() } }),
+      // Compact labels when docked or narrow, so the row never overflows
+      Button({ key: 'scope-mine', label: narrow ? 'Repo' : 'This repo', hotkey: '1', plain: true, dimColor: scope !== 'mine', onPress: () => { scope = 'mine'; redraw() } }),
+      Button({ key: 'scope-all', label: narrow ? 'Project' : 'Whole project', hotkey: '2', plain: true, dimColor: scope !== 'all', onPress: () => { scope = 'all'; redraw() } }),
       Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => { refresh($) } }),
-      Button({ key: 'layout', label: `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
-      ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: 'open in Harness' })] : []),
+      Button({ key: 'layout', label: narrow ? layout : `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
+      ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: narrow ? 'Harness' : 'open in Harness' })] : []),
     ],
   })
   const children = [header, controls]

@@ -1,3 +1,5 @@
+> **Full guide with screenshots:** see the [repository README](../../README.md). This file is the plugin's changelog and quick reference.
+
 # harness-cicd — Harness in Claude Code
 
 A Claude Code mod (plugin) that gives you one pane for Harness, scoped to the repo and branch your session is in:

@@ -232,6 +232,7 @@ test('without configuration the pane shows setup steps', async ($, on) => {
   expect(world.statuses.at(-1)).toBe('harness: not configured — run /harness for setup')
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'Not configured yet.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'setup needed' })).toBeDefined() // not "loading…" forever
 })
 
 test('an API error shows in the status line and the pane', async ($, on) => {
@@ -527,8 +528,11 @@ test('a saved layout is used next session; strip-first does not open the pane at
 test('docked layout: narrow rows and a deployed tab', async ($, on) => {
   const { clock } = harnessWorld(on, { store: { layout: 'dock' } })
   await start($, clock)
-  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'dock', bodyColumns: 70 } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'dock', bodyColumns: 62 } })
   expect(await ui.find({ type: 'Text', text: /^CI CD #3 +Running +3m$/ })).toBeDefined()
+  // Narrow: compact controls and the full project name
+  expect(((await ui.find({ key: 'scope-all' })) as any).props.label).toBe('Project')
+  expect(await ui.find({ type: 'Text', text: 'Harness · ORG/proj' })).toBeDefined()
   await ui.press({ key: 'tab' })
   expect(await ui.find({ type: 'Text', text: /^  ★ prod/ })).toBeDefined()
 })
@@ -657,6 +661,7 @@ test('approvals: the waiting approval is fetched with the documented request', a
   // Runs that aren't waiting are never asked about
   expect(reqs(world, '/approvals/execution/run2').length).toBe(0)
   expect(world.statuses.at(-1)).toContain('1 approval waiting')
+  expect(world.statuses.at(-1)).not.toContain('1 waiting ·') // not counted twice
 })
 
 test('approvals: the pane shows what is waiting, what it asks for, and who can approve', async ($, on) => {
@@ -689,7 +694,7 @@ test('approve: confirm, fill the approver input, confirm production, then POST t
   await ui.press({ key: 'appr-ap1' })
   await clock.settle()
   expect(world.asked).toEqual([
-    'Approve CI CD #3: "Approve deploy of 3-dev to prod?"?',
+    'Approve CI CD #3: "Approve deploy of 3-dev to prod"?',
     'Value for "version"?',
     'This lets CI CD #3 deploy to production (prod). Approve it?',
   ])
