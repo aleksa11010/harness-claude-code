@@ -1,6 +1,6 @@
-# Harness for Claude Code
+# Harness Platform for Claude Code
 
-**harness-cicd** puts Harness inside Claude Code: your branch's build, every pipeline run, what's deployed where, approvals, freeze windows and your pull request, in one pane next to your conversation with Claude. It diagnoses failures, lets you act on runs without leaving the terminal, and keeps Claude from pushing onto a broken build or touching production without asking you.
+**harness-platform** puts Harness inside Claude Code: your branch's build, every pipeline run, what's deployed where, approvals, freeze windows, your pull request, and every other Harness module (GitOps, security, feature flags, alerts, incidents, releases, IaCM, cost, catalog, chaos and more), in one pane next to your conversation with Claude. It diagnoses failures, lets you act on runs without leaving the terminal, and keeps Claude from pushing onto a broken build or touching production without asking you.
 
 ![The Harness pane: this branch, its pull request, recent runs with a diagnosed failure, promotion lanes and environments](docs/images/overview.png)
 
@@ -11,11 +11,13 @@ It's a Claude Code **mod**: a plugin with JavaScript hooks that draws its own in
 ## Contents
 
 - [Quick start](#quick-start)
+- [Home](#home-whats-happening-and-where-to-go)
 - [A tour of the pane](#a-tour-of-the-pane)
 - [Failure diagnosis](#failure-diagnosis)
 - [Acting on runs](#acting-on-runs)
 - [Approvals](#approvals)
 - [Deployment inventory](#deployment-inventory)
+- [Platform modules](#platform-modules)
 - [When your build fails](#when-your-build-fails)
 - [Guardrails](#guardrails)
 - [Layouts](#layouts)
@@ -50,13 +52,48 @@ git clone https://github.com/aleksa11010/harness-claude-code.git
 /harness
 ```
 
-If you chose to sign in instead of using an API key, do this once in Claude Code: `/mcp` → **plugin:harness-cicd:harness** → **Authenticate**. Then run `/harness doctor` to confirm everything works.
+If you chose to sign in instead of using an API key, do this once in Claude Code: `/mcp` → **plugin:harness-platform:harness** → **Authenticate**. Then run `/harness doctor` to confirm everything works.
+
+---
+
+## Home: what's happening, and where to go
+
+The pane opens on **Home**. It suggests the view that matters right now, and lists every view with a live badge so you can decide where to look.
+
+![Home during a production deploy: the deploy spotlighted with its stages live, then every view](docs/images/home-deploy.png)
+
+**Suggested now** shows up to three things, most important first, and `e` opens each one exactly where it is (the run selected, the approval in view, the module opened):
+
+| Situation | Suggestion | Opens |
+|---|---|---|
+| A production deploy is running | **Production deploy in progress**, with its stages live (`Build ✓ → Deploy prod ●`) | the run, in the project's pipelines |
+| Your commit failed | **Your commit failed** and why (diagnosis when ready) | the run with its diagnosis card |
+| An incident, or alerts on your service | **Active incident** / **Alerts on your service** | Operate |
+| An approval is waiting | **Approval waiting**, with expiry (production first) | Approvals |
+| A GitOps app is degraded | **GitOps app degraded** | GitOps |
+| A critical security issue on this repo | **Critical security issue** | Security |
+| A deployment freeze is active | **Deployment freeze** | Deployments |
+| Your PR's checks fail | **PR #n checks failing** | your change |
+| The stage before prod runs a newer version | **Ready to promote** | Deployments |
+| Your commit is building | **Your commit is building**, stages live | the run |
+
+When your build fails, the order changes with it:
+
+![Home when your commit failed: the failure first, then alerts on your service and a degraded GitOps app](docs/images/home-failing.png)
+
+On a quiet day it says so, and Home is just the menu:
+
+![Home on a quiet day](docs/images/home-quiet.png)
+
+**Views** (`1`–`9`): **Your change** (this branch's runs), **Deployments** ([inventory](#deployment-inventory)), **Approvals**, **Service** (this repo's service: versions, GitOps, health, security, owner), **Security**, **Operate**, **Platform** (the [modules](#platform-modules) for each purpose), **All modules**, and **Project runs**. `o` returns to Home from any view. A production deploy starting is also announced with a toast.
+
+**Choose your starting screen.** Home is the default. To open somewhere else, go to that view and press **`s`** ("Start here"), or run `/harness start <home|runs|inventory|approvals|service|platform>`; the installer asks too. Your choice is remembered, `★` marks the current one, and `/harness` always reopens on it. Pick **Your change** (`runs`) if you live in CI and want your branch's runs first, or **Deployments** if you're on a release or platform team.
 
 ---
 
 ## A tour of the pane
 
-Open it with `/harness`. In terminals at least 144 columns wide it also opens by itself when a session starts.
+Open it with `/harness`. In terminals at least 144 columns wide it also opens by itself when a session starts. It opens on [Home](#home-whats-happening-and-where-to-go); **Your change** (`1` on Home) is the view described here.
 
 ![The pane, top to bottom](docs/images/overview.png)
 
@@ -65,7 +102,7 @@ From top to bottom:
 | Section | What it shows |
 |---|---|
 | **Header** | The Harness org/project, when it last refreshed, and badges such as an active freeze or "auto-fix on". |
-| **Controls** | `1` **This repo** / `2` **Whole project**, `r` **Refresh**, `i` **[Inventory](#deployment-inventory)**, `v` **Layout**, and a link to the project in Harness. |
+| **Controls** | `1` **This repo** / `2` **Whole project**, `r` **Refresh**, `m` **[Platform](#platform-modules)**, `i` **[Inventory](#deployment-inventory)**, `v` **Layout**, and a link to the project in Harness. |
 | **This branch** | Your repo, branch and HEAD commit; whether *that exact commit* has been built, and the result; how far production is behind HEAD; the branch's open pull request. |
 | **Approvals waiting** | Appears when any run in the project waits for an approval (see [Approvals](#approvals)). |
 | **Pipelines** | Recent runs: status, what each built (`branch@commit`) or deployed (`service→environment`), and age. `❯` marks the selected run; failed runs open into a [diagnosis card](#failure-diagnosis). |
@@ -179,6 +216,41 @@ It reflects what Harness deployed, not what a cluster reports. Changes made outs
 
 ---
 
+## Platform modules
+
+Every Harness module, read through Harness's MCP server. Press `m` (or `/harness platform`) for the hub: one line per module with what needs attention, and `e` on any of them for its items.
+
+![The Platform hub: every Harness module with what needs attention](docs/images/platform.png)
+
+| | Module | What you see |
+|---|---|---|
+| ⎈ | **GitOps** | apps with Argo health and sync (Degraded, OutOfSync), and each service's app in the [inventory](#deployment-inventory) |
+| ⊛ | **Security (STO)** | issues by severity and target; production confirmations name critical issues on this repo |
+| ≣ | **Supply chain (SCS)** | artifact sources |
+| ⚑ | **Feature flags (FME)** | flags and rollout status, killed flags, and **flags referenced in your change** |
+| ◉ | **Alerts** | open alerts and the service they belong to |
+| ⊠ | **Incidents** | active incidents |
+| ▣ | **Artifact registry** | registries and artifact counts |
+| ➚ | **Releases** | releases in progress or failed, last 14 days |
+| § | **Policies (OPA)** | the project's policies |
+| ⌂ | **Infrastructure (IaCM)** | Terraform workspaces, failed or drifted |
+| ☰ | **Catalog (IDP)** | components and owners; each service's owner in the inventory |
+| $ | **Cloud cost (CCM)** | cost anomalies |
+| ⊟ | **Database DevOps** | schemas |
+| ↯ | **Chaos** | experiments, last result and resilience score |
+
+![One module opened: its items, worst first](docs/images/platform-open.png)
+
+What needs attention also shows at the top of the pane and in the band, refreshed every 5 minutes (`module_attention`, `modules_poll_minutes`), along with feature flags your branch touches:
+
+![The pane's attention line: degraded GitOps app, critical security issue, open alert, failed workspace, and flags in your change](docs/images/attention.png)
+
+A module that isn't enabled in your account, or that your access can't read, says so (`not available: …`) instead of showing nothing. Choose which modules appear with the `modules` setting. Claude reads them all through `harness_status` with `view: "modules"`.
+
+**Field coverage.** Each module's fields come from its own Harness API, passed through by the MCP server, so the plugin reads them with fallbacks for the shapes these APIs use. Run `/harness capture` once in a real project to save an anonymized snapshot (no names, IDs, emails, URLs or SHAs; status values and YAML structure kept) that can be used to tighten each module against your account's real responses.
+
+---
+
 ## When your build fails
 
 When a run fails **on your current HEAD commit**, the plugin diagnoses it and then, by default, asks:
@@ -287,7 +359,7 @@ The open pull request for your branch shows on the branch row, the band and the 
 **A line of context.** On prompts about building, deploying, releasing, pipelines or production, the plugin adds one short line of current Harness state, so Claude knows the situation without a tool call (`add_context`). For example:
 
 ```text
-[Harness, from the harness-cicd plugin] bootcamp-app@main (HEAD b0b0b0b): HEAD is CI CD #3 Running; bootcamp-app: dev 1-dev Expired, prod 3-dev Running; prod is 2 commits behind HEAD. Call the harness_status tool for details.
+[Harness, from the harness-platform plugin] bootcamp-app@main (HEAD b0b0b0b): HEAD is CI CD #3 Running; bootcamp-app: dev 1-dev Expired, prod 3-dev Running; prod is 2 commits behind HEAD. Call the harness_status tool for details.
 ```
 
 The pane's write actions are for you, not Claude. Claude acts on Harness through the Harness MCP server, where the [guardrails](#guardrails) apply.
@@ -372,6 +444,8 @@ What each feature needs:
 
 ## Installing
 
+> **Upgrading from `harness-cicd`?** The plugin is now **`harness-platform`**. Re-run `install.sh`: it removes `harness-cicd` and installs `harness-platform`. Without the installer: `claude plugin uninstall harness-cicd@harness-tools`, then `claude plugin marketplace update harness-tools` and `claude plugin install harness-platform@harness-tools`. Settings start fresh: enter your project and key again.
+
 ### With the installer (macOS / Linux)
 
 ```bash
@@ -382,7 +456,7 @@ It asks for your org ID, project ID, Harness URL, layout, whether to allow write
 
 1. checks Claude Code is v2.1.287 or later;
 2. copies the plugin to `~/.claude-plugins/harness-tools` (you can delete the download afterwards);
-3. registers the marketplace and installs `harness-cicd@harness-tools`, or updates it if already installed;
+3. registers the marketplace and installs `harness-platform@harness-tools`, or updates it if already installed;
 4. saves your settings; **the API key goes to your OS credential store**, never `settings.json` and never a command line;
 5. runs `/harness doctor` and tells you whether it's done, or exactly what to fix.
 
@@ -398,22 +472,22 @@ It uses no `sudo` and changes nothing outside `~/.claude-plugins` and Claude Cod
 
 ```bash
 claude plugin marketplace add aleksa11010/harness-claude-code
-claude plugin install harness-cicd@harness-tools --config org_id=YOUR_ORG --config project_id=YOUR_PROJECT
+claude plugin install harness-platform@harness-tools --config org_id=YOUR_ORG --config project_id=YOUR_PROJECT
 ```
 
-Then in Claude Code, either `/plugin configure harness-cicd@harness-tools` to paste an API key, or `/mcp` → **plugin:harness-cicd:harness** → **Authenticate**.
+Then in Claude Code, either `/plugin configure harness-platform@harness-tools` to paste an API key, or `/mcp` → **plugin:harness-platform:harness** → **Authenticate**.
 
 ### Trying it without installing
 
 ```bash
 export HARNESS_API_KEY=pat.…  HARNESS_DEFAULT_ORG_ID=YOUR_ORG  HARNESS_DEFAULT_PROJECT_ID=YOUR_PROJECT
-claude --plugin-dir ./harness-claude-code/plugins/harness-cicd
+claude --plugin-dir ./harness-claude-code/plugins/harness-platform
 ```
 
 ### Updating and removing
 
 ```bash
-claude plugin marketplace update harness-tools && claude plugin update harness-cicd@harness-tools
+claude plugin marketplace update harness-tools && claude plugin update harness-platform@harness-tools
 claude plugin marketplace remove harness-tools        # removes the plugin too
 ```
 
@@ -427,10 +501,11 @@ Without settings, the pane shows what's missing:
 
 | | Sign in with Harness | API key |
 |---|---|---|
-| Setup | `/mcp` → **plugin:harness-cicd:harness** → **Authenticate**, once | paste a PAT or service-account token |
+| Setup | `/mcp` → **plugin:harness-platform:harness** → **Authenticate**, once | paste a PAT or service-account token |
 | How | Harness's hosted MCP server, bundled in the plugin, through Claude Code's own OAuth connection | Harness REST API |
 | Requires | hosted MCP enabled for your Harness account | a key with view permissions |
 | Pull requests (Harness Code) | not yet | ✓ |
+| Platform modules | through the hosted Harness MCP server | through Harness's MCP server running locally (`npx harness-mcp-v2`, needs **Node.js**), started by Claude Code with your key |
 | Step logs for diagnosis | through `harness_diagnose` | through the log service |
 
 The account ID is read from the key, or from Harness's links in sign-in mode. With an API key, give it **view** access to pipelines and executions, services, environments, and freeze windows, plus Code repos for pull requests. For write actions, Harness's normal execute and approve permissions apply; the plugin never needs more than you have. A service-account key works; set `skip_user_lookup` so "runs you triggered" isn't attempted.
@@ -443,11 +518,14 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 
 | Command | Does |
 |---|---|
-| `/harness` | open the pane (text report where panes can't draw) |
+| `/harness` | open the pane on Home (text report where panes can't draw) |
 | `/harness all` · `/harness mine` | open on the whole project / this repo |
 | `/harness refresh` | refresh now |
 | `/harness doctor` | read-only checks of everything |
+| `/harness start <view>` | choose the starting screen: `home` · `runs` · `inventory` · `approvals` · `service` · `platform` |
 | `/harness inventory` | every service × environment with its live version |
+| `/harness platform` | every Harness module, with what needs attention |
+| `/harness capture` | save an anonymized snapshot of real responses (`harness-capture.json`) |
 | `/harness diagnose [run id]` | diagnose the latest failed run, or that one |
 | `/harness layout <stacked\|focus\|dock\|strip>` | switch layout |
 | `/harness autofix on\|off` | switch "when your build fails" between auto and ask |
@@ -456,9 +534,11 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 
 | Key | | Key | |
 |---|---|---|---|
-| `1` / `2` | this repo / whole project | `a` | actions for the selected run |
+| `o` | Home, from any view | `1`–`9` | on Home: jump to a view |
+| `s` | make this view your starting screen | | |
+| `1` / `2` | in runs: this repo / whole project | `a` | actions for the selected run |
 | `r` | refresh | `e` | expand / collapse the diagnosis card (inventory: service details) |
-| `i` | inventory / back to runs | | |
+| `i` | inventory / back to runs | `m` | platform modules / back to runs |
 | `v` | next layout | `f` | fix with Claude |
 | `j` / `k` | select next / previous run | `d` | diagnose |
 | `w` | switch tab (dock layout) | `q` | close the actions menu |
@@ -468,7 +548,7 @@ In the actions menu: `t` retry failed stages, `u` rerun, `x` abort, `p` approve,
 
 ### Settings
 
-Set them in the installer, `/plugin configure harness-cicd@harness-tools`, or `--config key=value` at install.
+Set them in the installer, `/plugin configure harness-platform@harness-tools`, or `--config key=value` at install.
 
 | Setting | Default | |
 |---|---|---|
@@ -478,6 +558,7 @@ Set them in the installer, `/plugin configure harness-cicd@harness-tools`, or `-
 | `account_id` | from the key | |
 | `base_url` | `https://app.harness.io` | regional or self-managed Harness URL |
 | `repo_name` | git `origin` | match runs to this repo name instead |
+| `start_view` | `home` | `home` · `runs` · `inventory` · `approvals` · `service` · `platform` (or press `s` in the pane) |
 | `layout` | `stacked` | `stacked` · `focus` · `dock` · `strip` |
 | `band` | `true` | the band above the prompt |
 | `auto_open` | `true` | open the pane when a session starts (wide terminals) |
@@ -492,8 +573,11 @@ Set them in the installer, `/plugin configure harness-cicd@harness-tools`, or `-
 | `max_runs` | `50` | 10–100 recent runs per refresh |
 | `inventory_days` | `90` | 7–365 days of deploy history for the inventory |
 | `inventory_max_runs` | `500` | 100–2000 CD runs per inventory scan |
+| `modules` | all 14 | which platform modules to show |
+| `module_attention` | `true` | refresh modules in the background and show what needs attention |
+| `modules_poll_minutes` | `5` | 1–60 |
 | `skip_user_lookup` | `false` | for service-account keys |
-| `mcp_server` | `plugin:harness-cicd:harness` | the Harness MCP server for sign-in mode |
+| `mcp_server` | `plugin:harness-platform:harness` | the Harness MCP server for sign-in mode |
 
 ### Environment variables
 
@@ -506,6 +590,7 @@ Read at session start; useful per shell or in CI. The first four are the same on
 | `HARNESS_DEFAULT_ORG_ID` · `HARNESS_DEFAULT_PROJECT_ID` | `org_id` · `project_id` |
 | `HARNESS_BASE_URL` | `base_url` |
 | `HARNESS_CICD_LAYOUT` | `layout` |
+| `HARNESS_PLATFORM_START` | `start_view` |
 | `HARNESS_CICD_ON_FAILURE` · `HARNESS_CICD_PUSH_GUARD` · `HARNESS_CICD_DIAGNOSE` | those settings |
 | `HARNESS_CICD_ALLOW_ACTIONS=1` | turns on `allow_actions` |
 
@@ -555,6 +640,8 @@ Write, **only with `allow_actions` and after you confirm**:
 
 In sign-in mode the same operations go through the Harness MCP server's `harness_list`, `harness_get`, `harness_execute` and `harness_diagnose` tools.
 
+**Platform modules** always go through Harness's MCP server: the hosted one when you sign in, or the plugin's bundled local one (`harness-mcp-v2`, pinned to 3.2.32) when you use an API key. Claude Code starts the local server itself and passes it your key from the plugin's settings; the installer downloads it once so the first start is quick. Each module is one `harness_list` call every 5 minutes.
+
 ---
 
 ## Privacy and safety
@@ -576,7 +663,7 @@ Start with `/harness doctor`; every ✗ line says what's wrong and what still wo
 |---|---|---|
 | `harness: not configured` | no project ID | set `project_id` (and sign in or set a key) |
 | `Harness refused the API key (HTTP 401)` | key wrong, expired, or for another account | create a new key; re-run the installer |
-| `Harness sign-in needed: run /mcp …` | sign-in mode, not signed in yet | `/mcp` → **plugin:harness-cicd:harness** → **Authenticate** |
+| `Harness sign-in needed: run /mcp …` | sign-in mode, not signed in yet | `/mcp` → **plugin:harness-platform:harness** → **Authenticate** |
 | `No runs found for repo "x"` | no pipeline builds this repo and no service's manifests are in it, or the names differ | see [Which repo?](#which-repo-how-your-checkout-connects-to-harness); set `repo_name` |
 | `✗ Git connectors — can't read …` | the key can't view the connector behind a service's manifests | grant view on connectors |
 | Actions greyed out "(off: allow_actions)" | write actions are off | turn on `allow_actions` |
@@ -585,11 +672,13 @@ Start with `/harness doctor`; every ✗ line says what's wrong and what still wo
 | GitHub PR not shown | `gh` missing or not signed in | install `gh`, run `gh auth login` |
 | The pane never opens by itself | terminal narrower than 144 columns | type `/harness`, or widen the terminal |
 | Nothing draws in VS Code | the VS Code chat panel doesn't draw panes | use the text report, or the terminal |
+| Every module "not available" with an API key | the local Harness MCP server didn't start (no Node.js, or its first download timed out) | install Node.js; `/mcp` → **plugin:harness-platform:harness-local** → reconnect |
+| Two answers to `/harness` | the old `harness-cicd` plugin is still installed | `claude plugin uninstall harness-cicd@harness-tools` |
 
 The plugin's log lines:
 
 ```bash
-claude -p "/harness doctor" --debug-to-stderr 2>&1 | grep harness-cicd
+claude -p "/harness doctor" --debug-to-stderr 2>&1 | grep harness-platform
 ```
 
 ---
@@ -600,29 +689,29 @@ claude -p "/harness doctor" --debug-to-stderr 2>&1 | grep harness-cicd
 harness-claude-code/
 ├── .claude-plugin/marketplace.json     the marketplace "harness-tools" (one plugin)
 ├── .github/workflows/ci.yml            CI on GitHub Actions
-├── .harness/harness-cicd-ci.yaml       the same CI as a Harness pipeline
+├── .harness/harness-platform-ci.yaml       the same CI as a Harness pipeline
 ├── install.sh                          installer
 ├── docs/images/                        screenshots for this README
-└── plugins/harness-cicd/
+└── plugins/harness-platform/
     ├── .claude-plugin/plugin.json      manifest: settings, bundled Harness MCP server
     ├── hooks/hooks.json                points to the hooks module
     ├── hooks/register.js               hooks, Harness calls, rendering
     ├── hooks/lib.js                    pure logic: parsing, matching, diagnosis prompts, guards
-    └── tests/                          110 tests (claude plugin test)
+    └── tests/                          135 tests (claude plugin test)
 ```
 
 ```bash
-cd plugins/harness-cicd
+cd plugins/harness-platform
 claude plugin validate --strict ../..   # manifest, hooks, and every API the mod calls
-claude plugin test                      # 110 tests, no network or sign-in needed
+claude plugin test                      # 135 tests, no network or sign-in needed
 claude --plugin-dir .                   # try your changes in a real session
 ```
 
 The tests drive the plugin through Claude Code's mod test kit: they stub Harness with responses shaped like the real APIs, press keys in the pane, answer its questions, and check what it draws and what it sends.
 
-**CI.** Every push and pull request runs `claude plugin validate --strict` and `claude plugin test` on GitHub Actions (`.github/workflows/ci.yml`). The same checks exist as a Harness pipeline, **harness-cicd plugin CI** (`.harness/harness-cicd-ci.yaml`), triggered by pushes to the Harness Code mirror.
+**CI.** Every push and pull request runs `claude plugin validate --strict` and `claude plugin test` on GitHub Actions (`.github/workflows/ci.yml`). The same checks exist as a Harness pipeline, **harness-platform plugin CI** (`.harness/harness-platform-ci.yaml`), triggered by pushes to the Harness Code mirror.
 
-**Releasing.** Bump `version` in `plugins/harness-cicd/.claude-plugin/plugin.json`, push to `main`, wait for green. Teammates then run `claude plugin marketplace update harness-tools && claude plugin update harness-cicd@harness-tools`.
+**Releasing.** Bump `version` in `plugins/harness-platform/.claude-plugin/plugin.json`, push to `main`, wait for green. Teammates then run `claude plugin marketplace update harness-tools && claude plugin update harness-platform@harness-tools`.
 
 ---
 

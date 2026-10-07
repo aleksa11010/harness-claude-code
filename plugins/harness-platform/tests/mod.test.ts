@@ -1,0 +1,1586 @@
+import { expect, mock, test } from 'claude-code/testing'
+import { executions, services, environments, envelope, T0 } from './fixtures.ts'
+
+const TOOL = 'mcp__harness-platform__harness_status'
+const PANE = {
+  plugin: 'harness-platform',
+  component: 'Pane',
+  requestId: 'harness',
+  viewport: { columns: 140, rows: 40 },
+  props: {
+    title: 'Harness', isFocused: true, bodyColumns: 100, placement: 'inline',
+    scroll: { offset: 0, bodyRows: 30 }, view: {},
+  },
+} as const
+
+const ENV = { HARNESS_API_KEY: 'pat.ACC123.tok.secret', HARNESS_DEFAULT_PROJECT_ID: 'proj', HARNESS_DEFAULT_ORG_ID: 'ORG', HARNESS_PLATFORM_START: 'runs' }
+
+// Stubs for everything the mod asks Claude Code for. `world` lets a test change Harness's answers.
+function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?: number; surfaces?: string[]; slowMs?: number; answer?: string | string[]; model?: string; behind?: string; store?: Record<string, unknown>; remote?: string; mcp?: (tool: string, args: any) => any } = {}) {
+  const world = {
+    executions: structuredClone(executions) as any[],
+    requests: [] as { url: string; init?: any }[],
+    statuses: [] as (string | undefined)[],
+    toasts: [] as string[],
+    prompts: [] as string[],
+    contexts: [] as string[][],
+    asked: [] as string[],
+    modelCalls: [] as any[],
+    logs: [] as string[],
+    opened: [] as any[],
+    store: undefined as unknown as Map<string, unknown>,
+    // Documented shape of GET /v1/…/approvals/execution/{id}?approval_status=WAITING (a bare array)
+    approvalList: [{
+      id: 'ap1', type: 'HarnessApproval', status: 'WAITING', deadline: T0 + 3 * 3600_000, created: T0 - 20 * 60_000, updated: T0, error_message: '',
+      details: { approvalMessage: 'Approve deploy of 3-dev to prod?', approvers: { userGroups: ['_project_all_users', 'release-managers'], minimumCount: 1 }, approverInputs: [{ name: 'version', defaultValue: '3-dev' }] },
+    }] as any[],
+    approvalPost: null as null | { status: number; text: string },
+    inputs: '' as string, // inputSetYaml the run used
+    template: '' as string, // runtime input template
+    freezeList: [] as any[],
+    globalFreeze: { status: 'Disabled' } as any,
+    prList: [] as any[], prChecks: [] as any, prReviewers: [] as any,
+    gh: null as null | { exitCode: number; stdout: string; stderr: string },
+    cdRuns: [] as any[], // the project's CD history, served 100 per page for module=CD
+    extraServices: [] as any[],
+    connector: null as null | { status: number; data?: any },
+    headTime: 0, // seconds, `git log -1 --format=%ct`
+    pending: null as null | ((since: number, paths: string[]) => number),
+    gitCalls: [] as string[],
+    diff: '' as string, // `git diff --unified=0 @{upstream}...HEAD`
+    writes: [] as { path: string; text: string }[],
+    mcpCalls: [] as any[],
+  }
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, opts.env ?? ENV)
+  const store = new Map(Object.entries(opts.store ?? {}))
+  on('store.get', ($: any, e: any) => ({ value: store.get(e.key) }))
+  on('store.set', ($: any, e: any) => { store.set(e.key, e.value); return { value: undefined } })
+  world.store = store
+  on('ui.close', () => ({ value: undefined }))
+  on('fs.write', ($: any, e: any) => { world.writes.push({ path: e.path, text: e.text }); return { value: undefined } })
+  on('session.cwd', () => ({ value: '/work' }))
+  on('session.start', () => ({ cwd: '/work' }))
+  on('tool.register', () => ({ value: undefined }))
+  on('command.register', () => ({ value: undefined }))
+  on('ui.open', ($: any, e: any) => { world.opened.push(e); return { value: { isPlaced: true } } })
+  on('ui.status', ($: any, e: any) => { world.statuses.push(e.text); return { value: undefined } })
+  on('ui.toast', ($: any, e: any) => { world.toasts.push(e.text); return { value: undefined } })
+  on('prompt.submit', ($: any, e: any) => { world.prompts.push(e.text); world.contexts.push([...(e.context ?? [])]); return { text: e.text } })
+  on('ui.log', ($: any, e: any) => { world.logs.push(e.text); return { value: undefined } })
+  on('model.complete', ($: any, e: any) => {
+    world.modelCalls.push(e)
+    return { value: { isAnswered: true, text: opts.model ?? '{"cause":"Pod taskmanager OOMKilled at startup (limit 256Mi)","evidence":"Last State: OOMKilled","fix":"Lower CACHE_MAX_ENTRIES or raise the memory limit","confidence":"high"}', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
+  })
+  on('session.repo', () => ({ value: { root: '/work', remote: opts.remote ?? 'https://git.example.com/ACC123/ORG/bootcamp-app.git', internal: false, name: null } }))
+  on('mcp.call', ($: any, e: any) => {
+    world.mcpCalls.push(e)
+    if (!opts.mcp) throw new Error('unknown server ' + e.server)
+    const out = opts.mcp(e.tool, e.args)
+    return { value: out?.isError ? out : { content: [{ type: 'text', text: JSON.stringify(out) }], isError: false } }
+  })
+  on('process.run', ($: any, e: any) => {
+    const cmd = e.argv.join(' ')
+    if (cmd === 'git rev-parse --abbrev-ref HEAD') return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
+    if (cmd === 'git rev-parse HEAD') return { value: { exitCode: 0, stdout: 'b0b0b0b0b0b0b0b0\n', stderr: '' } }
+    if (cmd.startsWith('git rev-list --count') && opts.behind) return { value: { exitCode: 0, stdout: opts.behind + '\n', stderr: '' } }
+    world.gitCalls.push(cmd)
+    if (cmd === 'git log -1 --format=%ct HEAD' && world.headTime) return { value: { exitCode: 0, stdout: world.headTime + '\n', stderr: '' } }
+    if (cmd.startsWith('git rev-list --count --since=') && world.pending) {
+      const since = Number(/--since=(\d+)/.exec(cmd)![1])
+      return { value: { exitCode: 0, stdout: world.pending(since, e.argv.slice(e.argv.indexOf('--') + 1)) + '\n', stderr: '' } }
+    }
+    if (cmd.startsWith('git diff --unified=0 ')) return { value: world.diff ? { exitCode: 0, stdout: world.diff, stderr: '' } : { exitCode: 128, stdout: '', stderr: 'no upstream' } }
+    if (cmd.startsWith('gh pr view')) return { value: world.gh ?? { exitCode: 1, stdout: '', stderr: 'no pull requests found for branch "main"' } }
+    return { value: { exitCode: 1, stdout: '', stderr: 'unknown' } }
+  })
+  on('http.fetch', async ($: any, e: any) => {
+    world.requests.push({ url: e.url, init: e.init })
+    if (opts.slowMs) await clock.sleep(opts.slowMs)
+    if (opts.httpStatus) return { value: { status: opts.httpStatus, ok: false, headers: {}, text: '' } }
+    const ok = (d: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: envelope(d) } })
+    if (e.url.includes('/pipeline/api/pipelines/execution/summary') && e.url.includes('module=CD')) {
+      const page = Number(new URL(e.url).searchParams.get('page') || 0)
+      return ok({ content: world.cdRuns.slice(page * 100, page * 100 + 100) })
+    }
+    if (e.url.includes('/pipeline/api/pipelines/execution/summary')) return ok({ content: world.executions })
+    if (e.url.includes('/ng/api/servicesV2')) return ok({ content: [...services, ...world.extraServices] })
+    if (e.url.includes('/ng/api/connectors/')) return world.connector?.status === 200 ? ok(world.connector.data) : { value: { status: world.connector?.status ?? 404, ok: false, headers: {}, text: JSON.stringify({ message: 'denied' }) } }
+    if (e.url.includes('/ng/api/environmentsV2')) return ok({ content: environments })
+    if (e.url.includes('/ng/api/user/currentUser')) return ok({ email: 'dev@example.com' })
+    if (e.url.includes('/pipeline/api/v1/') && e.url.includes('/approvals/execution/')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(world.approvalList) } }
+    if (e.url.includes('/inputsetV2')) return ok({ inputSetYaml: world.inputs })
+    if (e.url.includes('/pipeline/api/inputSets/template')) return ok({ inputSetTemplateYaml: world.template })
+    if (e.url.includes('/ng/api/freeze/getGlobalFreeze')) return ok(world.globalFreeze)
+    if (e.url.includes('/ng/api/freeze/list')) return ok({ content: world.freezeList })
+    const bare = (d: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(d) } })
+    if (/\/code\/api\/v1\/repos\/.+\/pullreq\/\d+\/checks/.test(e.url)) return bare(world.prChecks)
+    if (/\/code\/api\/v1\/repos\/.+\/pullreq\/\d+\/reviewers/.test(e.url)) return bare(world.prReviewers)
+    if (/\/code\/api\/v1\/repos\/.+\/pullreq\?/.test(e.url)) return bare(world.prList)
+    if (e.url.includes('/harness/activity') && world.approvalPost) return { value: { ...world.approvalPost, ok: world.approvalPost.status < 300, headers: {} } }
+    if (e.url.includes('/pipeline/api/pipeline/execute/') || e.url.includes('/pipeline/api/approvals/')) return ok({ planExecution: { uuid: 'new1' } })
+    return { value: { status: 404, ok: false, headers: {}, text: '' } }
+  })
+  on('session.surfaces', () => ({ value: opts.surfaces ?? ['terminal'] }))
+  on('ui.render', ($: any, e: any) => { const { Text } = $.ui.resolve(e); return Text({ children: ['(engine band)'] }) }) // core's own drawing
+  // What Claude Code answers: AskUserQuestion (from $.ui.ask) gets the scripted answer, every other tool "ok"
+  on('tool.call', ($: any, e: any) => {
+    if (e.tool === 'AskUserQuestion') {
+      const q = e.questions[0].question
+      world.asked.push(q)
+      const a = Array.isArray(opts.answer) ? opts.answer[world.asked.length - 1] : opts.answer
+      if (!a) throw new Error('no one to ask')
+      return { result: { answers: { [q]: a } } }
+    }
+    return { result: 'ok' }
+  })
+  return { world, clock }
+}
+
+async function start($: any, clock: any) {
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.advance(600) // first refresh runs 500 ms after start
+}
+
+test('refresh calls the three Harness endpoints with the API key and scope', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const urls = world.requests.map((r) => r.url)
+  expect(urls.some((u) => u.startsWith('https://app.harness.io/pipeline/api/pipelines/execution/summary?'))).toBe(true)
+  expect(urls.some((u) => u.includes('/ng/api/servicesV2?'))).toBe(true)
+  expect(urls.some((u) => u.includes('/ng/api/environmentsV2?'))).toBe(true)
+  const summary = world.requests.find((r) => r.url.includes('execution/summary'))!
+  expect(summary.url).toContain('accountIdentifier=ACC123')
+  expect(summary.url).toContain('orgIdentifier=ORG')
+  expect(summary.url).toContain('projectIdentifier=proj')
+  expect(summary.init.method).toBe('POST')
+  expect(summary.init.headers['x-api-key']).toBe('pat.ACC123.tok.secret')
+  expect(JSON.parse(summary.init.body)).toEqual({ filterType: 'PipelineExecution' })
+  // auto_open defaults to true
+  expect(world.opened[0]).toMatchObject({ id: 'harness' })
+})
+
+test('status line summarizes your branch', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  expect(world.statuses.at(-1)).toBe('harness: main@b0b0b0b ● Running · 1 running · 1 failed')
+})
+
+test('the pane shows this branch, your runs, and what is deployed where', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /^bootcamp-app @ main {2}HEAD b0b0b0b/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Running · #3/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^CI CD #3 / })).toBeDefined()
+    // guestflow runs are another repo: hidden in "This repo"
+    expect(await ui.find({ type: 'Text', text: /guestflow_api_pipeline/ })).toBeUndefined()
+    // Promotion lanes: dev shows the newest (failed) deploy, prod the running one, with ages
+    expect(await ui.find({ type: 'Text', text: /^✗ 1-dev/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^● 3-dev/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^9d/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^1m/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /Deploy dev: Please Check the timeout/ })).toBeDefined()
+    // Failed rows keep their age visible next to the diagnose / open / ask Claude controls
+    expect(await ui.find({ key: 'diag-run2' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^CI CD #2 .*Expired +10d$/ })).toBeDefined()
+    // Section rules are drawn to full width, without a truncation mark
+    expect(await ui.find({ type: 'Text', text: /^── DEPLOYED ─+$/ })).toBeDefined()
+    // Whole project shows the other repo's runs too
+    await ui.press({ key: 'scope-all' })
+    expect(await ui.find({ type: 'Text', text: /^guestflow_api_pipe\S*… #2 / })).toBeDefined() // long names truncate, run number stays
+    await ui.press({ key: 'scope-mine' })
+    await ui.unmount()
+  }
+  expect(world.prompts.length).toBe(0)
+})
+
+test('"ask Claude" on a failed run starts a turn with the failure and link', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'ask-run2' })
+  expect(world.prompts.length).toBe(1)
+  expect(world.prompts[0]).toContain('"CI CD" #2 ended Expired')
+  expect(world.prompts[0]).toContain('/deployments/run2/pipeline')
+  expect(world.prompts[0]).toContain('harness_diagnose')
+})
+
+test('Claude can read the same state through the harness_status tool', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: TOOL })
+  const s = JSON.parse(out.result)
+  expect(s.project).toBe('ORG/proj')
+  expect(s.git).toEqual({ repo: 'bootcamp-app', branch: 'main', head: 'b0b0b0b' })
+  expect(s.this_branch.head_built).toBe('Running')
+  expect(s.deployed[0].environments.prod).toMatchObject({ status: 'Running', artifact: '3-dev' })
+  const all: any = await $.tool.call({ tool: TOOL, scope: 'all' })
+  expect(JSON.parse(all.result).executions.length).toBe(5)
+})
+
+test('a git push turns on fast polling and you get a toast when the run finishes', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const before = world.requests.length
+  await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+  expect(world.toasts.at(-1)).toBe('Watching Harness for the pipeline this push triggers…')
+
+  // The prod deploy finishes in Harness
+  world.executions[0].status = 'Success'
+  await clock.advance(8000)
+  expect(world.requests.length).toBeGreaterThan(before)
+  expect(world.toasts.at(-1)).toBe('✓ CI CD #3 Success')
+
+  // While watching, refreshes come every ~10 s instead of every 60 s
+  const n = world.requests.length
+  await clock.advance(15000)
+  expect(world.requests.length).toBeGreaterThan(n)
+})
+
+test('other Bash commands are passed through untouched', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git status' })
+  expect(out).toEqual({ result: 'ok' })
+  expect(world.toasts.length).toBe(0)
+})
+
+test('without configuration the pane shows setup steps', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: {} })
+  await start($, clock)
+  expect(world.requests.length).toBe(0)
+  expect(world.statuses.at(-1)).toBe('harness: not configured — run /harness for setup')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Not configured yet.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'setup needed' })).toBeDefined() // not "loading…" forever
+})
+
+test('an API error shows in the status line and the pane', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { httpStatus: 401 })
+  await start($, clock)
+  expect(world.statuses.at(-1)).toMatch(/^harness: Harness refused the API key \(HTTP 401\)/)
+})
+
+test('/harness opens the focused pane in the terminal', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out).toEqual({})
+  expect(world.opened.at(-1)).toMatchObject({ id: 'harness', focus: true })
+})
+
+test('/harness answers in text where nothing draws (claude -p, VS Code chat)', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  await start($, clock)
+  const opensBefore = world.opened.length
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out.text).toContain('Harness ORG/proj — this repo')
+  expect(out.text).toContain('Branch bootcamp-app @ main, HEAD b0b0b0b: ● Running')
+  expect(out.text).toContain('↳ Deploy dev: Please Check the timeout')
+  expect(out.text).toMatch(/bootcamp-app — dev: ✗ 1-dev \(9d\) \| prod: ● 3-dev \(1m\)/)
+  expect(world.opened.length).toBe(opensBefore)
+  const all: any = await $.command.run({ command: 'harness', args: 'all' })
+  expect(all.text).toContain('whole project')
+  expect(all.text).toContain('guestflow_api_pipeline #2')
+})
+
+test('/harness without configuration explains setup in text', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: {}, surfaces: ['vscode'] })
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out.text).toMatch(/^Harness: not configured/)
+})
+
+test('/harness during a background refresh waits for it instead of printing stale data', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [], slowMs: 2000 })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.advance(600) // background refresh starts; Harness takes 2 s to answer
+  const pendingCmd = $.command.run({ command: 'harness', args: '' })
+  await clock.advance(5000) // the core calls, then freeze windows, each 2 s
+  const out: any = await pendingCmd
+  expect(out.text).toContain('Branch bootcamp-app @ main, HEAD b0b0b0b: ● Running')
+  // One refresh, not two: three endpoints, the one-time user lookup, and the two freeze reads
+  expect(world.requests.length).toBe(6)
+})
+
+test('a rejected key backs off instead of retrying every 5 seconds', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { httpStatus: 401, surfaces: [] })
+  await start($, clock)
+  expect(world.requests.length).toBe(4) // one attempt: three endpoints + user lookup
+  // /harness right after shows the error without hitting Harness again
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out.text).toMatch(/refused the API key \(HTTP 401\)/)
+  expect(world.requests.length).toBe(4)
+  // No 5-second retry storm: next attempt after the poll interval (60 s)…
+  await clock.advance(55_000)
+  expect(world.requests.length).toBe(4)
+  await clock.advance(10_000)
+  expect(world.requests.length).toBe(8)
+  // …then 120 s after that
+  await clock.advance(100_000)
+  expect(world.requests.length).toBe(8)
+  await clock.advance(30_000)
+  expect(world.requests.length).toBe(12)
+  // An explicit /harness refresh always tries
+  await $.command.run({ command: 'harness', args: 'refresh' })
+  expect(world.requests.length).toBe(16)
+})
+
+test('unconfigured: no polling at all', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: {} })
+  await start($, clock)
+  await clock.advance(10 * 60_000)
+  expect(world.requests.length).toBe(0)
+})
+
+test('healthy: polls every 60 s, every 10 s while watching a push', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  await clock.advance(58_000)
+  expect(world.requests.length).toBe(6) // 3 core + user lookup + 2 freeze reads
+  await clock.advance(7_000) // the 5-second scheduler tick at 65 s is the first one past 60 s
+  expect(world.requests.length).toBe(9) // user lookup once; freeze is cached for 5 minutes
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  await clock.advance(30_000)
+  expect(world.requests.length).toBeGreaterThanOrEqual(13)
+})
+
+test('/harness before the startup refresh does not cause a second refresh', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  const out: any = await $.command.run({ command: 'harness', args: '' }) // what `claude -p "/harness"` does
+  expect(out.text).toContain('this repo')
+  await clock.advance(2_000) // the 500 ms startup timer has now fired
+  expect(world.requests.length).toBe(6)
+})
+
+// ---------------------------------------------------------------- new features
+
+const failHead = (w: any) => { w.executions[0].status = 'Failed'; w.executions[0].layoutNodeMap.b.status = 'Failed'; w.executions[0].layoutNodeMap.b.failureInfo = { message: 'Deployment did not stabilize in 10m' } }
+
+test('diagnose button: diagnoses a failed run with a small model and shows the cause', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'diag-run2' })
+  await clock.settle()
+  expect(world.modelCalls.length).toBe(1)
+  expect(world.modelCalls[0].model).toBe('haiku')
+  expect(world.modelCalls[0].prompt).toContain('stage "Deploy dev": Expired — Please Check the timeout')
+  await ui.unmount()
+  const ui2 = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  // The expanded card shows cause, evidence, likely fix and where it came from
+  expect(await ui2.find({ type: 'Text', text: /^Pod taskmanager OOMKilled at startup/ })).toBeDefined()
+  expect(await ui2.find({ type: 'Text', text: 'Last State: OOMKilled' })).toBeDefined()
+  expect(await ui2.find({ type: 'Text', text: /^Lower CACHE_MAX_ENTRIES/ })).toBeDefined()
+  expect(await ui2.find({ type: 'Text', text: 'high confidence · from failure messages only' })).toBeDefined()
+  expect(((await ui2.find({ key: 'diag-run2' })) as any)?.props?.label).toBe('diagnose again')
+  // Claude sees it through the tool, without another model call
+  const out: any = await $.tool.call({ tool: TOOL })
+  expect(JSON.parse(out.result).executions.find((x: any) => x.id === 'run2').diagnosis.cause).toMatch(/OOMKilled/)
+  expect(world.modelCalls.length).toBe(1)
+})
+
+test('/harness diagnose answers in text', async ($, on) => {
+  const { clock } = harnessWorld(on, { surfaces: [] })
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'diagnose' })
+  expect(out.text).toContain('Cause: Pod taskmanager OOMKilled at startup')
+  expect(out.text).toContain('high confidence, from failure messages only')
+})
+
+test('on_failure=ask: your commit fails → diagnosis → "Let Claude fix it" starts a fix turn', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Let Claude fix it' })
+  await start($, clock)
+  failHead(world)
+  await clock.advance(65_000)
+  await clock.settle()
+  expect(world.asked.at(-1)).toMatch(/^CI CD #3 failed on your commit: Pod taskmanager OOMKilled at startup .*What now\?$/)
+  expect(world.prompts.length).toBe(1)
+  expect(world.prompts[0]).toContain('Diagnosis: Pod taskmanager OOMKilled')
+  expect(world.prompts[0]).toContain('then commit and push')
+})
+
+test('on_failure=ask: "Ignore" does nothing more', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Ignore' })
+  await start($, clock)
+  failHead(world)
+  await clock.advance(65_000)
+  await clock.settle()
+  expect(world.asked.length).toBe(1)
+  expect(world.prompts.length).toBe(0)
+})
+
+test('on_failure=auto: Claude fixes up to the attempt limit, then hands back', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: { ...ENV, HARNESS_CICD_ON_FAILURE: 'auto' } })
+  await start($, clock)
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // a new run on HEAD fails each time
+    const x = structuredClone(world.executions[0])
+    x.planExecutionId = 'fix' + attempt; x.runSequence = 3 + attempt
+    x.status = 'Failed'; x.layoutNodeMap.b.status = 'Failed'
+    world.executions.unshift(x)
+    await clock.advance(65_000)
+    await clock.settle()
+  }
+  expect(world.asked.length).toBe(0)
+  expect(world.prompts.length).toBe(2)
+  expect(world.prompts[0]).toContain('Auto-fix attempt 1 of 2')
+  expect(world.prompts[1]).toContain('Auto-fix attempt 2 of 2')
+  expect(world.toasts.at(-1)).toBe('Auto-fix stopped after 2 attempts on CI CD. Over to you.')
+})
+
+test('push guard (hold): "Don\'t push" blocks the push and tells Claude why', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: "Don't push" })
+  failHead(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push origin main' })
+  expect(world.asked[0]).toMatch(/^Claude wants to push, but main is red in Harness: CI CD #3 Failed/)
+  expect(out.deny).toMatch(/^The user chose not to push yet: main is red/)
+  expect(world.toasts.includes('Watching Harness for the pipeline this push triggers…')).toBe(false)
+})
+
+test('push guard (hold): "Push anyway" lets it through and starts watching', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Push anyway' })
+  failHead(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(out).toEqual({ result: 'ok' })
+  expect(world.toasts.at(-1)).toBe('Watching Harness for the pipeline this push triggers…')
+})
+
+test('push guard: green build, or warn mode, never asks', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: { ...ENV, HARNESS_CICD_PUSH_GUARD: 'warn' } })
+  failHead(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(out).toEqual({ result: 'ok' })
+  expect(world.asked.length).toBe(0)
+  expect(world.toasts[0]).toMatch(/^Pushing while main is red/)
+})
+
+test('push guard in claude -p (nobody to ask): the push goes ahead and is logged', async ($, on) => {
+  const { world, clock } = harnessWorld(on) // no scripted answer: AskUserQuestion fails
+  failHead(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(out).toEqual({ result: 'ok' })
+  expect(world.logs).toContain('push guard: nobody to ask, so the push goes ahead')
+})
+
+test('production guardrail: Harness write to prod asks; Cancel denies', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Cancel' })
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'mcp__Harness__harness_execute', action: 'run', resource_id: 'CI_CD', inputs: { env: 'prod' } })
+  expect(world.asked[0]).toBe('Claude wants to run harness_execute against production (prod). Allow it?')
+  expect(out.deny).toBe('The user did not allow this production action.')
+})
+
+test('production guardrail: Allow runs it; non-prod and read tools are never asked', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Allow' })
+  await start($, clock)
+  expect(await $.tool.call({ tool: 'mcp__Harness__harness_execute', action: 'run', inputs: { env: 'prod' } })).toEqual({ result: 'ok' })
+  expect(world.asked.length).toBe(1)
+  expect(await $.tool.call({ tool: 'mcp__Harness__harness_execute', action: 'run', inputs: { env: 'dev' } })).toEqual({ result: 'ok' })
+  expect(await $.tool.call({ tool: 'mcp__Harness__harness_list', resource_type: 'environment', search_term: 'prod' })).toEqual({ result: 'ok' })
+  expect(world.asked.length).toBe(1)
+})
+
+test('production guardrail with nobody to ask: denied', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'mcp__Harness__harness_execute', action: 'rollback', params: { environment: 'production' } })
+  expect(out.deny).toMatch(/needs the user to confirm it, but nobody could be asked/)
+})
+
+test('automatic context: CI/deploy prompts get one line of Harness state; others none', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { behind: '3' })
+  world.executions.push({ ...structuredClone(executions[0]), planExecutionId: 'prodok', status: 'Success',
+    moduleInfo: { ...executions[0].moduleInfo, ci: { ...executions[0].moduleInfo.ci, ciPipelineStageModuleInfo: { ...executions[0].moduleInfo.ci.ciPipelineStageModuleInfo, commitId: 'c0ffee' } } },
+    layoutNodeMap: { b: { ...executions[0].layoutNodeMap.b, status: 'Success' } } })
+  await start($, clock)
+  await $.prompt.submit({ text: 'deploy this to qa' })
+  await $.prompt.submit({ text: 'rename this variable' })
+  expect(world.contexts[0].length).toBe(1)
+  expect(world.contexts[0][0]).toMatch(/^\[Harness, from the harness-platform plugin\] bootcamp-app@main \(HEAD b0b0b0b\): HEAD is CI CD #3 Running/)
+  expect(world.contexts[0][0]).toContain('prod is 3 commits behind HEAD')
+  expect(world.contexts[1].length).toBe(0)
+  // …and the same number shows in the pane and the tool
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'prod 3 behind' })).toBeDefined()
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.prod_commits_behind_head).toBe(3)
+})
+
+// ---------------------------------------------------------------- round 2: your design picks
+
+const reqs = (w: any, part: string) => w.requests.filter((r: any) => r.url.includes(part))
+
+test('layout is a preference: v cycles stacked → focus → dock → strip and it is saved', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(((await ui.find({ key: 'layout' })) as any)?.props?.label).toBe('Layout: stacked')
+  await ui.press({ key: 'layout' })
+  await clock.settle()
+  expect(world.store.get('layout')).toBe('focus')
+  expect(await ui.find({ type: 'Text', text: '● Building your commit b0b0b0b: CI CD #3 · 3m.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^▸ deployed: bootcamp-app/ })).toBeDefined()
+  await ui.press({ key: 'layout' })
+  await clock.settle()
+  expect(world.store.get('layout')).toBe('dock')
+  expect(world.opened.at(-1)).toMatchObject({ id: 'harness', columns: 72, focus: true }) // reopened for docking
+  await ui.press({ key: 'layout' })
+  await clock.settle()
+  expect(world.store.get('layout')).toBe('strip')
+  const out: any = await $.command.run({ command: 'harness', args: 'layout nope' })
+  expect(out.text).toBe('Layouts: stacked, focus, dock, strip (now: strip). Use /harness layout <name>, or press v in the pane.')
+})
+
+test('a saved layout is used next session; strip-first does not open the pane at start', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { store: { layout: 'strip' } })
+  await start($, clock)
+  expect(world.opened.length).toBe(0)
+  const out: any = await $.command.run({ command: 'harness', args: 'layout focus' })
+  expect(out.text).toBe('Layout: focus.')
+})
+
+test('docked layout: narrow rows and a deployed tab', async ($, on) => {
+  const { clock } = harnessWorld(on, { store: { layout: 'dock' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'dock', bodyColumns: 62 } })
+  expect(await ui.find({ type: 'Text', text: /^CI CD #3 +Running +3m$/ })).toBeDefined()
+  // Narrow: compact controls and the full project name
+  expect(((await ui.find({ key: 'scope-all' })) as any).props.label).toBe('Project')
+  expect(await ui.find({ type: 'Text', text: 'Harness · ORG/proj' })).toBeDefined()
+  await ui.press({ key: 'tab' })
+  expect(await ui.find({ type: 'Text', text: /^  ★ prod/ })).toBeDefined()
+})
+
+test('focus layout when your commit failed: headline plus the diagnosis card', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { store: { layout: 'focus' } })
+  failHead(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '✗ Your commit b0b0b0b failed: CI CD #3 Failed.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Deploy prod: Deployment did not stabilize/ })).toBeDefined()
+})
+
+test('select a row, then act: j/k move the selection, a opens that run\'s actions', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }) // selection starts on the failed run
+  expect(await ui.find({ key: 'act-retry' })).toBeDefined()
+  expect(await ui.find({ key: 'act-diagnose' })).toBeDefined()
+  await ui.press({ key: 'sel-down' }) // → CI CD #1, Success; moving closes the menu
+  expect(await ui.find({ key: 'act-retry' })).toBeUndefined()
+  await ui.press({ key: 'actions' })
+  expect(await ui.find({ key: 'act-rerun' })).toBeDefined()
+  expect(await ui.find({ key: 'act-retry' })).toBeUndefined()
+  await ui.press({ key: 'sel-up' }); await ui.press({ key: 'sel-up' }) // → CI CD #3, Running
+  await ui.press({ key: 'actions' })
+  expect(await ui.find({ key: 'act-abort' })).toBeDefined()
+  await ui.press({ key: 'act-close' })
+  expect(await ui.find({ key: 'act-abort' })).toBeUndefined()
+})
+
+test('e collapses and re-expands the diagnosis card', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Deploy dev: Please Check/ })).toBeDefined()
+  await ui.press({ key: 'expand' })
+  expect(await ui.find({ type: 'Text', text: /^Deploy dev: Please Check/ })).toBeUndefined()
+  await ui.press({ key: 'expand' })
+  expect(await ui.find({ type: 'Text', text: /^Deploy dev: Please Check/ })).toBeDefined()
+})
+
+test('write actions are off by default and say how to turn them on', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' })
+  expect(((await ui.find({ key: 'act-retry' })) as any)?.props?.label).toBe('t  Retry failed stages  (off: allow_actions)')
+  await ui.press({ key: 'act-retry' })
+  expect(world.toasts.at(-1)).toBe('Actions are off. Turn on "allow_actions" in /plugin configure harness-platform@harness-tools.')
+  expect(reqs(world, '/execute/retry/').length).toBe(0)
+})
+
+const ON = { ...ENV, HARNESS_CICD_ALLOW_ACTIONS: '1' }
+
+test('retry failed stages: confirm, then POST retry with the failed stage ids', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: 'Retry' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' })
+  await ui.press({ key: 'act-retry' })
+  await clock.settle()
+  expect(world.asked[0]).toBe('Retry the failed stages of CI CD #2 (Deploy_dev)?')
+  const r = reqs(world, '/pipeline/api/pipeline/execute/retry/CI_CD?')
+  expect(r.length).toBe(1)
+  expect(r[0].init.method).toBe('POST')
+  expect(r[0].url).toContain('planExecutionId=run2')
+  expect(r[0].url).toContain('retryStages=Deploy_dev')
+  expect(r[0].url).toContain('runAllStages=false')
+  expect(r[0].init.headers['Content-Type']).toBe('application/yaml')
+  expect(world.toasts.at(-1)).toBe('✓ Retrying CI CD #2')
+})
+
+test('cancel means nothing is sent', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: 'Cancel' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(reqs(world, '/execute/').length).toBe(0)
+})
+
+test('production gets a second confirmation', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Retry', 'Cancel'] })
+  failHead(world) // CI CD #3 deploys to prod
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(world.asked).toEqual(['Retry the failed stages of CI CD #3 (Deploy_prod)?', 'This deploys to production (prod). Are you sure?'])
+  expect(reqs(world, '/execute/retry/').length).toBe(0)
+})
+
+test('production confirmed twice: the retry goes out', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Retry', 'Yes, deploy to production'] })
+  failHead(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(reqs(world, '/execute/retry/').length).toBe(1)
+})
+
+test('abort a running run: PUT interrupt AbortAll', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: 'Abort' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'sel-up' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-abort' }); await clock.settle()
+  const r = reqs(world, '/pipeline/api/pipeline/execute/interrupt/run5?')
+  expect(r.length).toBe(1)
+  expect(r[0].init.method).toBe('PUT')
+  expect(r[0].url).toContain('interruptType=AbortAll')
+})
+
+const awaitApproval = (w: any) => { w.executions[0].status = 'ApprovalWaiting'; w.executions[0].layoutNodeMap.b.status = 'ApprovalWaiting' }
+
+test('approvals: the waiting approval is fetched with the documented request', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON })
+  awaitApproval(world)
+  await start($, clock)
+  const r = reqs(world, '/pipeline/api/v1/orgs/ORG/projects/proj/approvals/execution/run5?')
+  expect(r.length).toBe(1)
+  expect(r[0].url).toContain('approval_status=WAITING')
+  expect(r[0].url).toContain('accountIdentifier=ACC123')
+  expect(r[0].init.headers['Harness-Account']).toBe('ACC123')
+  expect(r[0].init.headers['x-api-key']).toBe('pat.ACC123.tok.secret')
+  // Runs that aren't waiting are never asked about
+  expect(reqs(world, '/approvals/execution/run2').length).toBe(0)
+  expect(world.statuses.at(-1)).toContain('1 approval waiting')
+  expect(world.statuses.at(-1)).not.toContain('1 waiting ·') // not counted twice
+})
+
+test('approvals: the pane shows what is waiting, what it asks for, and who can approve', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── APPROVALS WAITING · 1 ─+$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'CI CD #3  bootcamp-app→prod  expires in 2h 59m · waiting 20m' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    Approve deploy of 3-dev to prod?' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    approvers: _project_all_users, release-managers · asks for: version' })).toBeDefined()
+  expect(await ui.find({ key: 'appr-ap1' })).toBeDefined()
+  expect(await ui.find({ key: 'rej-ap1' })).toBeDefined()
+})
+
+test('approvals: read-only until allow_actions is on', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'appr-ap1' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'approve/reject: turn on allow_actions' })).toBeDefined()
+})
+
+test('approve: confirm, fill the approver input, confirm production, then POST the activity', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev-hotfix', 'Yes, approve for production'] })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'appr-ap1' })
+  await clock.settle()
+  expect(world.asked).toEqual([
+    'Approve CI CD #3: "Approve deploy of 3-dev to prod"?',
+    'Value for "version"?',
+    'This lets CI CD #3 deploy to production (prod). Approve it?',
+  ])
+  const post = reqs(world, '/pipeline/api/approvals/ap1/harness/activity')
+  expect(post.length).toBe(1)
+  expect(post[0].init.method).toBe('POST')
+  expect(JSON.parse(post[0].init.body)).toEqual({ action: 'APPROVE', comments: 'From Claude Code (harness-platform)', approverInputs: [{ name: 'version', value: '3-dev-hotfix' }] })
+  expect(world.toasts.at(-1)).toBe('✓ Approved CI CD #3')
+  expect(await ui.find({ key: 'appr-ap1' })).toBeUndefined() // gone from the pane straight away
+})
+
+test('approve: Cancel at any step sends nothing', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', 'Cancel'] })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'appr-ap1' }); await clock.settle()
+  expect(reqs(world, '/harness/activity').length).toBe(0)
+})
+
+test('reject: one confirmation, no inputs, no production prompt', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject'] })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'rej-ap1' }); await clock.settle()
+  expect(world.asked.length).toBe(1)
+  expect(JSON.parse(reqs(world, '/pipeline/api/approvals/ap1/harness/activity')[0].init.body)).toEqual({ action: 'REJECT', comments: 'From Claude Code (harness-platform)' })
+  expect(world.toasts.at(-1)).toBe('✓ Rejected CI CD #3')
+})
+
+test('approve from the actions menu (a → p) uses the same flow', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev', 'Yes, approve for production'] })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'sel-up' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-approve' }); await clock.settle()
+  expect(JSON.parse(reqs(world, '/harness/activity')[0].init.body).approverInputs).toEqual([{ name: 'version', value: '3-dev' }])
+})
+
+test('not an approver: Harness\'s own message is shown', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject'] })
+  awaitApproval(world)
+  world.approvalPost = { status: 403, text: JSON.stringify({ status: 'ERROR', code: 'ACCESS_DENIED', message: 'User not authorized to approve/reject' }) }
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'rej-ap1' }); await clock.settle()
+  expect(world.toasts.at(-1)).toBe("✗ Couldn't reject CI CD #3: User not authorized to approve/reject (HTTP 403)")
+})
+
+test('Jira and ServiceNow approvals point you to where they are decided', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON })
+  awaitApproval(world)
+  world.approvalList = [{ id: 'j1', type: 'JiraApproval', status: 'WAITING', deadline: 0, created: T0 - 60_000, details: {} }]
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'decide in Jira' })).toBeDefined()
+  expect(await ui.find({ key: 'appr-j1' })).toBeUndefined()
+})
+
+test('a new approval is announced once, in a toast and the band', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON })
+  await start($, clock)
+  awaitApproval(world)
+  await clock.advance(65_000)
+  expect(world.toasts.filter((t: string) => t.startsWith('◆')).length).toBe(1)
+  expect(world.toasts.at(-1)).toBe('◆ CI CD #3 is waiting for approval to deploy to prod')
+  await clock.advance(65_000)
+  expect(world.toasts.filter((t: string) => t.startsWith('◆')).length).toBe(1)
+  const band = await $.ui.mount({ plugin: 'harness-platform', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 140, rows: 40 },
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 9 } } as any })
+  expect(await band.find({ type: 'Text', text: '◆ 1 approval waiting' })).toBeDefined()
+})
+
+test('Claude sees waiting approvals in harness_status', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  awaitApproval(world)
+  await start($, clock)
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.approvals_waiting).toEqual([{
+    run: 'CI CD #3', execution_id: 'run5', approval_id: 'ap1', type: 'HarnessApproval', message: 'Approve deploy of 3-dev to prod?',
+    approvers: ['_project_all_users', 'release-managers'], minimum: 1, inputs: ['version'], expires: 'expires in 2h 59m', deploys_to: ['prod'],
+    url: 'https://app.harness.io/ng/account/ACC123/all/orgs/ORG/projects/proj/pipelines/CI_CD/deployments/run5/pipeline',
+  }])
+})
+
+test('production guardrail: Claude approving a prod-bound run through the Harness MCP server asks you', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Cancel' })
+  awaitApproval(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'mcp__Harness__harness_execute', resource_type: 'approval_instance', action: 'approve', approval_id: 'ap1' })
+  expect(world.asked[0]).toBe('Claude wants to run harness_execute against production (prod). Allow it?')
+  expect(out.deny).toBe('The user did not allow this production action.')
+})
+
+test('when your build fails, "Always auto-fix" switches to auto and remembers it', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Always auto-fix' })
+  await start($, clock)
+  failHead(world)
+  await clock.advance(65_000)
+  await clock.settle()
+  expect(world.asked[0]).toMatch(/What now\?$/)
+  expect(world.store.get('on_failure')).toBe('auto')
+  expect(world.prompts[0]).toContain('Auto-fix attempt 1 of 2')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^auto-fix on · updated/ })).toBeDefined()
+  const off: any = await $.command.run({ command: 'harness', args: 'autofix off' })
+  expect(off.text).toBe('Auto-fix off.')
+  expect(world.store.get('on_failure')).toBe('ask')
+})
+
+test('band above the prompt: your commit, a sparkline, prod lag, and h opens the pane', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { behind: '2' })
+  world.executions.push({ ...structuredClone(executions[0]), planExecutionId: 'prodok', status: 'Success', startTs: T0 - 2 * 86400_000,
+    moduleInfo: { ...executions[0].moduleInfo, ci: { ...executions[0].moduleInfo.ci, ciPipelineStageModuleInfo: { ...executions[0].moduleInfo.ci.ciPipelineStageModuleInfo, commitId: 'c0ffee' } } },
+    layoutNodeMap: { b: { ...executions[0].layoutNodeMap.b, status: 'Success' } } })
+  await start($, clock)
+  const band = await $.ui.mount({ plugin: 'harness-platform', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 140, rows: 40 },
+    props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 9 } } as any })
+  expect(await band.find({ type: 'Text', text: '● main@b0b0b0b Running #3' })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: '▂' })).toBeDefined() // oldest: the successful prod deploy
+  expect(await band.find({ type: 'Text', text: '█' })).toBeDefined() // the expired run
+  expect(await band.find({ type: 'Text', text: 'prod 2 behind' })).toBeDefined()
+  expect(await band.find({ type: 'Text', text: '(engine band)' })).toBeDefined() // core's own band stays
+  await band.press({ key: 'band-open' })
+  expect(world.opened.at(-1)).toMatchObject({ id: 'harness', focus: true })
+})
+
+test('band yields to a survey', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const band = await $.ui.mount({ plugin: 'harness-platform', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 140, rows: 40 },
+    props: { hasSurvey: true, isWorking: false, maxRows: 10, bodyColumns: 140, scroll: { offset: 0, bodyRows: 9 } } as any })
+  expect(await band.find({ key: 'band-open' })).toBeUndefined()
+  expect(await band.find({ type: 'Text', text: '(engine band)' })).toBeDefined()
+})
+
+// ---------------------------------------------------------------- doctor, runtime inputs, freeze, sign-in, PRs
+
+test('/harness doctor: read-only checks with a clear verdict for each', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.template = 'pipeline:\n  identifier: CI_CD\n  stages:\n    - stage:\n        identifier: Deploy\n        spec:\n          tag: <+input>'
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  const t = out.text as string
+  expect(t.split('\n')[0]).toBe('Harness doctor · ORG/proj · https://app.harness.io')
+  expect(t).toContain('✓ Auth — API key (pat…), account ACC123')
+  expect(t).toContain('✓ Pipeline runs — 5 recent runs, 3 from this repo')
+  expect(t).toContain('✓ Services & environments — 2 services, 3 environments (1 production)')
+  expect(t).toContain('✓ User — dev@example.com')
+  expect(t).toContain('✓ Git — bootcamp-app @ main b0b0b0b')
+  expect(t).toContain('✗ Step details —') // the stub has no execution graph: reported, with the fallback
+  expect(t).toMatch(/✓ Approvals API — readable \(\d+ waiting on CI CD #2\)/)
+  expect(t).toContain('✓ Freeze windows — none active')
+  expect(t).toContain('· Runtime inputs: CI_CD — 1 (tag): rerun/retry reuse the original run\'s inputs, and ask for any it lacks')
+  expect(t).toContain('· Pull requests — repo host not supported (Harness Code or GitHub)')
+  expect(t).toContain('· Behaviour — diagnose auto · on failure ask · push guard hold · prod guard on · actions off')
+  // Doctor never writes
+  expect(world.requests.every((r: any) => (r.init?.method ?? 'GET') !== 'PUT' && !/execute|activity/.test(r.url))).toBe(true)
+})
+
+test('rerun reuses the inputs the run used', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: 'Rerun' })
+  world.inputs = 'pipeline:\n  identifier: CI_CD\n  variables:\n    - name: reason\n      value: nightly'
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'sel-down' }) // CI CD #1, Success → rerun
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-rerun' }); await clock.settle()
+  const r = reqs(world, '/pipeline/api/pipeline/execute/rerun/run1/CI_CD')
+  expect(r.length).toBe(1)
+  expect(r[0].init.body).toBe(world.inputs)
+  expect(r[0].init.headers['Content-Type']).toBe('application/yaml')
+  expect(world.toasts.at(-1)).toBe('✓ Rerunning CI CD #1 with the inputs it used')
+})
+
+test('retry asks for runtime inputs when the run has none recorded', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Retry', 'stable'] })
+  world.template = 'pipeline:\n  identifier: CI_CD\n  stages:\n    - stage:\n        identifier: Deploy\n        spec:\n          tag: <+input>.allowedValues(latest,stable)'
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(world.asked[1]).toBe('Runtime input "tag" (Deploy)?')
+  const r = reqs(world, '/execute/retry/CI_CD')
+  expect(r[0].init.body).toContain('tag: stable')
+  expect(world.toasts.at(-1)).toBe('✓ Retrying CI CD #2 with your inputs')
+})
+
+test('too many runtime inputs: hands off instead of a long quiz', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: 'Retry' })
+  world.template = 'pipeline:\n' + Array.from({ length: 8 }, (_, i) => `  v${i}: <+input>`).join('\n')
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(reqs(world, '/execute/retry/').length).toBe(0)
+  expect(world.toasts.at(-1)).toBe('CI CD #2 needs 8 runtime inputs: run it from Harness, or ask Claude to run it with the inputs.')
+})
+
+const activeFreeze = (w: any) => { w.freezeList = [{ identifier: 'q4', name: 'Q4 freeze', status: 'Enabled', currentOrUpcomingWindow: { startTime: T0 - 3600_000, endTime: T0 + 2 * 3600_000 } }] }
+
+test('freeze: shown everywhere, blocks production actions, warns on others', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Retry'] })
+  activeFreeze(world)
+  failHead(world) // CI CD #3 → prod
+  await start($, clock)
+  expect(world.statuses.at(-1)).toMatch(/^harness: ❄ Q4 freeze until 2026-10-05 14:00 UTC · main@b0b0b0b/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^❄ Q4 freeze until .* · updated now$/ })).toBeDefined()
+  // production retry is blocked outright
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(world.asked.length).toBe(0)
+  expect(world.toasts.at(-1)).toMatch(/^❄ Q4 freeze .*: not running CI CD #3, it deploys to production/)
+  // a dev retry is allowed, with the freeze named in the confirmation
+  await ui.press({ key: 'sel-down' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(world.asked[0]).toBe('Retry the failed stages of CI CD #2 (Deploy_dev) (❄ Q4 freeze until 2026-10-05 14:00 UTC is active)?')
+})
+
+test('freeze: Claude\'s production actions through the Harness MCP server are refused, not asked', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: 'Allow' })
+  activeFreeze(world)
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'mcp__Harness__harness_execute', action: 'run', inputs: { env: 'prod' } })
+  expect(world.asked.length).toBe(0)
+  expect(out.deny).toMatch(/^A deployment freeze is active \(Q4 freeze until .*\)\. This Harness action targets production \(prod\), so it was not run/)
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.freeze.active[0].name).toBe('Q4 freeze')
+})
+
+test('freeze: an enabled but future window is not active', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.freezeList = [{ identifier: 'later', name: 'Holiday freeze', status: 'Enabled', currentOrUpcomingWindow: { startTime: T0 + 86400_000, endTime: T0 + 2 * 86400_000 } }]
+  await start($, clock)
+  expect(world.statuses.at(-1)).not.toContain('❄')
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toContain('✓ Freeze windows — none active, next: Holiday freeze')
+})
+
+// Sign-in mode: no API key, everything through Harness's MCP server (Claude Code's OAuth connection)
+const mcpHarness = (w: any) => (tool: string, args: any) => {
+  if (tool === 'harness_list' && args.resource_type === 'execution') return { items: w.executions.map((x: any) => ({ ...x, openInHarness: `https://app.harness.io/ng/account/ACC123/all/orgs/ORG/projects/proj/pipelines/${x.pipelineIdentifier}/deployments/${x.planExecutionId}/pipeline` })), total: 5 }
+  if (tool === 'harness_list' && args.resource_type === 'service') return { items: services, total: 2 }
+  if (tool === 'harness_list' && args.resource_type === 'environment') return { items: environments, total: 3 }
+  if (tool === 'harness_list' && args.resource_type === 'approval_instance') return { items: w.approvalList, total: w.approvalList.length }
+  if (tool === 'harness_list' && args.resource_type === 'freeze_window') return { items: [], total: 0 }
+  if (tool === 'harness_get' && args.resource_type === 'global_freeze') return { status: 'Disabled' }
+  if (tool === 'harness_get' && args.resource_type === 'execution_inputs') return { inputSetYaml: '' }
+  if (tool === 'harness_get' && args.resource_type === 'runtime_input_template') return { inputSetTemplateYaml: '' }
+  return { ok: true }
+}
+const SIGNIN = { HARNESS_DEFAULT_PROJECT_ID: 'proj', HARNESS_DEFAULT_ORG_ID: 'ORG', HARNESS_CICD_ALLOW_ACTIONS: '1', HARNESS_PLATFORM_START: 'runs' }
+
+test('sign-in mode: no API key, data comes through the Harness MCP server', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => mcpHarness(w)(t, a) })
+  w = world
+  await start($, clock)
+  expect(world.requests.length).toBe(0) // no REST calls at all
+  const lists = world.mcpCalls.filter((c: any) => c.tool === 'harness_list').map((c: any) => c.args.resource_type)
+  expect(lists).toEqual(expect.arrayContaining(['execution', 'service', 'environment', 'freeze_window']))
+  expect(world.mcpCalls[0]).toMatchObject({ server: 'plugin:harness-platform:harness', args: { org_id: 'ORG', project_id: 'proj', compact: false } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^CI CD #3 / })).toBeDefined()
+  // account id learned from Harness's own links
+  expect(((await ui.find({ type: 'Link', label: 'open in Harness' } as any)) as any)?.props?.href).toContain('/ng/account/ACC123/')
+})
+
+test('sign-in mode: actions go through harness_execute', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => mcpHarness(w)(t, a), answer: 'Abort' })
+  w = world
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'sel-up' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-abort' }); await clock.settle()
+  const ex = world.mcpCalls.find((c: any) => c.tool === 'harness_execute')
+  expect(ex.args).toMatchObject({ resource_type: 'execution', action: 'interrupt', resource_id: 'run5', params: { interrupt_type: 'AbortAll' }, confirm: true })
+  expect(world.toasts.at(-1)).toBe('✓ Aborted CI CD #3')
+})
+
+test('sign-in mode: approvals list and decide through the MCP server', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => mcpHarness(w)(t, a), answer: ['Reject'] })
+  w = world
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'rej-ap1' }); await clock.settle()
+  const ex = world.mcpCalls.find((c: any) => c.tool === 'harness_execute')
+  expect(ex.args).toMatchObject({ resource_type: 'approval_instance', action: 'reject', params: { approval_id: 'ap1' }, body: { comments: 'From Claude Code (harness-platform)' }, confirm: true })
+})
+
+test('sign-in mode, not signed in yet: says exactly what to do', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: SIGNIN })
+  await start($, clock)
+  expect(world.statuses.at(-1)).toMatch(/^harness: Harness sign-in needed: run \/mcp, choose the Harness server, Authenticate/)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toMatch(/✗ Pipelines API — Harness sign-in needed: .*\[.+\]/) // with the underlying error
+})
+
+test('pull request (Harness Code): checks and review on the branch row, the band and the status line', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { remote: 'https://git.harness.io/ACC123/ORG/bootcamp-app.git' })
+  world.prList = [{ number: 7, title: 'Faster cache', state: 'open', source_branch: 'main', target_branch: 'release', is_draft: false }, { number: 6, source_branch: 'other', state: 'open' }]
+  world.prChecks = { commit_sha: 'b0b0', checks: [{ required: true, check: { identifier: 'ci', status: 'failure' } }, { check: { identifier: 'lint', status: 'success' } }] }
+  world.prReviewers = [{ reviewer: { display_name: 'Ana' }, review_decision: 'pending' }]
+  await start($, clock)
+  expect(reqs(world, '/code/api/v1/repos/ACC123/ORG/bootcamp-app/+/pullreq?').length).toBe(1)
+  expect(reqs(world, '/code/api/v1/repos/ACC123/ORG/bootcamp-app/+/pullreq/7/checks').length).toBe(1)
+  expect(world.statuses.at(-1)).toContain('PR #7 ✗ 1 failing')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'PR #7 → release: 1 check failing · review pending (ci)' })).toBeDefined()
+  expect(((await ui.find({ type: 'Link', label: 'open', href: 'https://app.harness.io/ng/account/ACC123/module/code/orgs/ORG/repos/bootcamp-app/pulls/7' } as any)) as any)).toBeDefined()
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.pull_request).toMatchObject({ number: 7, target: 'release', review: 'review pending', checks: ['ci: failure', 'lint: success'] })
+})
+
+test('pull request (GitHub): read with the gh CLI', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { remote: 'git@github.com:acme/bootcamp-app.git' })
+  world.gh = { exitCode: 0, stderr: '', stdout: JSON.stringify({ number: 42, title: 'x', state: 'OPEN', isDraft: true, reviewDecision: 'APPROVED', baseRefName: 'main', url: 'https://github.com/acme/bootcamp-app/pull/42', statusCheckRollup: [{ name: 'build', conclusion: 'SUCCESS' }] }) }
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'PR #42 (draft) → main: checks passing · approved' })).toBeDefined()
+})
+
+test('pull request: none open is quiet', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { remote: 'git@github.com:acme/bootcamp-app.git' })
+  await start($, clock)
+  expect(world.statuses.at(-1)).not.toContain('PR #')
+})
+
+// ---------------------------------------------------------------- deployment inventory
+
+// 250 CD runs, one every 12 h going back from now: services api/web/worker round-robin, envs dev/qa/prod
+// in blocks of three, prod api alternating between two clusters. Run 0 (api→dev) is still running;
+// run 4 (web→qa) failed on top of an older success.
+const HOUR = 3600_000
+function cdHistory() {
+  const svcs = ['api', 'web', 'worker'], envs = ['dev', 'qa', 'prod']
+  return Array.from({ length: 250 }, (_, i) => {
+    const svc = svcs[i % 3], env = envs[Math.floor(i / 3) % 3]
+    const infra = env === 'prod' && svc === 'api' ? (Math.floor(i / 3) % 2 ? 'k8s-us' : 'k8s-eu') : env + '-k8s'
+    const status = i === 0 ? 'Running' : i === 4 ? 'Failed' : 'Success'
+    const t = T0 - i * 12 * HOUR
+    return {
+      planExecutionId: 'cd' + i, pipelineIdentifier: 'deploy_' + svc, name: 'Deploy ' + svc, runSequence: 1000 - i, status, startTs: t,
+      executionTriggerInfo: { triggeredBy: { identifier: i % 2 ? 'Ana' : 'Ben' } },
+      moduleInfo: { cd: { serviceIdentifiers: [svc], envIdentifiers: [env] } },
+      layoutNodeMap: { s: { nodeType: 'Deployment', nodeGroup: 'STAGE', nodeIdentifier: 'deploy', name: 'Deploy', module: 'cd', status, startTs: t,
+        moduleInfo: { cd: { serviceInfo: { identifier: svc, displayName: svc, artifacts: { primary: { tag: `${svc}-${i}` } } },
+          infraExecutionSummary: { identifier: env, name: env, type: env === 'prod' ? 'Production' : 'PreProduction', infrastructureName: infra } } } } },
+    }
+  })
+}
+const cdReqs = (w: any) => w.requests.filter((r: any) => r.url.includes('execution/summary') && r.url.includes('module=CD'))
+
+test('inventory: no history scan until you use it', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  await clock.advance(10 * 60_000)
+  expect(cdReqs(world).length).toBe(0)
+})
+
+test('inventory: scans CD history 100 at a time and stops at the window (90 days)', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  const r = cdReqs(world)
+  expect(r.map((x: any) => new URL(x.url).searchParams.get('page'))).toEqual(['0', '1']) // page 1 reaches past 90 days
+  expect(r[0].url).toContain('size=100')
+  expect(JSON.parse(r[0].init.body)).toEqual({ filterType: 'PipelineExecution' })
+})
+
+test('inventory: every service × environment with the live version, in-flight and failed deploys, drift', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS \(whole project\) · 4 services × 3 environments ─+$/ })).toBeDefined()
+  // api→dev: run 0 still deploying; run 9 (4.5 days ago) is what's live
+  expect(await ui.find({ type: 'Text', text: /^● api-9 4d/ })).toBeDefined()
+  // web→qa: run 4 failed on top of run 13 (6.5 days ago), which stays live
+  expect(await ui.find({ type: 'Text', text: /^! web-13 6d/ })).toBeDefined()
+  // api→prod: two clusters on different versions, and prod differs from qa
+  expect(await ui.find({ type: 'Text', text: /^✓ 2 versions 3d/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '⚠ prod ≠ qa' })).toBeDefined() // drift = prod differs from the stage before it
+  expect(await ui.find({ type: 'Text', text: 'not deployed in 90 days: guestflow-api' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'live = last good deploy per environment/infrastructure · 200 CD runs · 90d · scanned now' })).toBeDefined()
+  // 1 narrows the inventory to this repo's services
+  await ui.press({ key: 'scope-mine' })
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS \(this repo\) · 1 services/ })).toBeDefined()
+})
+
+test('inventory: e opens a service down to each infrastructure: version, when, who, which run', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'inv-expand' }) // first row: api
+  expect(await ui.find({ type: 'Text', text: /^★ prod · k8s-eu/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^★ prod · k8s-us/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^api-6 / })).toBeDefined() // run 6: eu cluster, 3 days ago
+  expect(await ui.find({ type: 'Text', text: '3d ago by Ben · Deploy api #994' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^    │   ↳ newer: api-0 Running just now \(Deploy api #1000\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    │ ⚠ prod runs a different version from qa' })).toBeDefined()
+  await ui.press({ key: 'inv-back' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+})
+
+test('inventory: text and tool for headless and for Claude', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'inventory' })
+  expect(out.text.split('\n')[0]).toBe('Deployments (whole project) — live version per service and environment')
+  expect(out.text).toContain('service | dev | qa | ★ prod')
+  expect(out.text).toMatch(/\napi \| ● api-9 4d \| ✓ api-3 1d \| ✓ 2 versions 3d   drift: prod ≠ qa/)
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL, view: 'inventory' })) as any).result)
+  const api = s.services.find((x: any) => x.service === 'api')
+  expect(api.environments.prod.infrastructures).toEqual([{ infra: 'k8s-eu', version: 'api-6' }, { infra: 'k8s-us', version: 'api-15' }])
+  expect(api.environments.dev.newer_attempt).toMatchObject({ version: 'api-0', status: 'Running' })
+  expect(api.drift).toEqual(['prod differs from qa'])
+})
+
+test('inventory in sign-in mode: the same scan through harness_list with module CD', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, surfaces: [], mcp: (t, a) => (t === 'harness_list' && a.resource_type === 'execution' && a.filters?.module === 'CD') ? { items: w.cdRuns.slice(a.page * 100, a.page * 100 + 100) } : mcpHarness(w)(t, a) })
+  w = world
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'inventory' })
+  expect(out.text).toContain('web | ✓ web-1')
+  const scans = world.mcpCalls.filter((c: any) => c.args?.filters?.module === 'CD')
+  expect(scans.map((c: any) => c.args.page)).toEqual([0, 1])
+})
+
+// ---------------------------------------------------------------- CD-only repos (manifests here, no build)
+
+const PAYMENTS_YAML = `service:
+  name: payments
+  identifier: payments
+  serviceDefinition:
+    type: Kubernetes
+    spec:
+      manifests:
+        - manifest:
+            identifier: k8s
+            type: K8sManifest
+            spec:
+              store:
+                type: Github
+                spec:
+                  connectorRef: org.gh_payments
+                  gitFetchType: Branch
+                  branch: main
+                  paths:
+                    - deploy/k8s
+                    - deploy/values.yaml
+      artifacts:
+        primary:
+          spec:
+            connectorRef: docker_hub
+`
+const payDeploy = (id: string, run: number, env: string, status: string, t: number, tag: string) => ({
+  planExecutionId: id, pipelineIdentifier: 'deploy_payments', name: 'Deploy payments', runSequence: run, status, startTs: t,
+  executionTriggerInfo: { triggeredBy: { identifier: 'Ana' } },
+  moduleInfo: { cd: { serviceIdentifiers: ['payments'], envIdentifiers: [env] } }, // no CI module: deploy-only
+  layoutNodeMap: { s: { nodeType: 'Deployment', nodeGroup: 'STAGE', nodeIdentifier: 'Deploy_' + env, name: 'Deploy ' + env, module: 'cd', status, startTs: t,
+    failureInfo: { message: status === 'Failed' ? 'Deployment did not stabilize in 10m' : '' },
+    moduleInfo: { cd: { serviceInfo: { identifier: 'payments', displayName: 'payments', artifacts: { primary: { tag } } },
+      infraExecutionSummary: { identifier: env, name: env, type: env === 'prod' ? 'Production' : 'PreProduction', infrastructureName: env + '-k8s' } } } } },
+})
+// dev deployed 2 days ago, prod 5 days ago; 3 commits touched the manifests since prod's deploy, none since dev's
+function cdOnlyWorld(on: any, opts: any = {}) {
+  const r = harnessWorld(on, { remote: 'git@github.com:acme/payments.git', ...opts })
+  const w = r.world
+  w.extraServices = [{ identifier: 'payments', name: 'payments', yaml: PAYMENTS_YAML }]
+  w.connector = { status: 200, data: { connector: { type: 'Github', spec: { url: 'git@github.com:acme/payments.git', type: 'Repo' } } } }
+  w.executions = [payDeploy('p11', 11, 'dev', 'Success', T0 - 2 * 86400_000, 'pay-11'), payDeploy('p9', 9, 'prod', 'Success', T0 - 5 * 86400_000, 'pay-9'), ...w.executions]
+  w.headTime = Math.floor((T0 - 2 * HOUR) / 1000)
+  w.pending = (since: number) => (since < Math.floor((T0 - 3 * 86400_000) / 1000) ? 3 : 0)
+  return r
+}
+
+test('CD-only: a repository-level connector ties the service to this repo', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { surfaces: [] })
+  await start($, clock)
+  const c = reqs(world, '/ng/api/connectors/gh_payments')
+  expect(c.length).toBe(1)
+  expect(c[0].url).toContain('orgIdentifier=ORG')
+  expect(c[0].url).not.toContain('projectIdentifier') // org-scoped connector
+  const out: any = await $.command.run({ command: 'harness', args: '' })
+  expect(out.text).toContain('Harness ORG/proj — this repo')
+  expect(out.text).toContain('Deploy payments #11 Success 2d — payments→dev')
+  expect(out.text).not.toContain('CI CD #') // the other repo's runs are not "this repo"
+})
+
+test('CD-only: manifest changes not yet deployed, per environment', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on)
+  await start($, clock)
+  const revs = world.gitCalls.filter((x: string) => x.startsWith('git rev-list --count --since='))
+  expect(revs.length).toBe(2) // dev and prod
+  expect(revs[0]).toMatch(/ HEAD -- deploy\/k8s deploy\/values\.yaml$/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^CD-only: deploys payments from manifests here/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^up to date · 2d/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^3 changes pending · 5d/ })).toBeDefined()
+  expect(world.statuses.at(-1)).toBe('harness: main@b0b0b0b CD-only · prod 3 pending') // not "not built"
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.cd_only_repo).toBe(true)
+  expect(s.manifest_changes_pending).toEqual({ 'payments→dev': 0, 'payments→prod': 3 })
+})
+
+test('CD-only: the inventory says which environments are missing your manifest changes', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'scope-mine' })
+  await ui.press({ key: 'inv-expand' })
+  expect(await ui.find({ type: 'Text', text: '    │   manifests in this repo: 3 commits since this deploy, not deployed yet' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    │   manifests in this repo: no changes since this deploy' })).toBeDefined()
+})
+
+test('CD-only push guard: holds the push while the last deploy of this repo\'s service is failing', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: "Don't push" })
+  world.executions.unshift(payDeploy('p12', 12, 'prod', 'Failed', T0 - HOUR, 'pay-12'))
+  await start($, clock)
+  const out: any = await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(world.asked[0]).toBe('Claude wants to push, but the last deploy of payments to prod failed in Harness (Deploy payments #12: Deploy prod: Deployment did not stabilize in 10m). Push anyway?')
+  expect(out.deny).toMatch(/^The user chose not to push yet: the last deploy of payments to prod failed/)
+})
+
+test('CD-only failure flow: a deploy after your manifest change fails → diagnosis → fix aimed at the manifests', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: 'Let Claude fix it' })
+  await start($, clock)
+  world.executions.unshift(payDeploy('p13', 13, 'prod', 'Failed', T0 + 30_000, 'pay-13')) // after HEAD (2 h ago)
+  await clock.advance(65_000); await clock.settle()
+  expect(world.asked[0]).toMatch(/^Deploy payments #13 failed deploying payments to prod after your latest manifest change: Pod taskmanager OOMKilled.*What now\?$/)
+  expect(world.prompts[0]).toContain('This repo holds the deployment manifests (no build in Harness): deploy/k8s, deploy/values.yaml.')
+})
+
+test('CD-only: a deploy that started before your latest commit is not "yours"', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { answer: 'Ignore' })
+  world.headTime = Math.floor((T0 + 10 * 60_000) / 1000) // you committed after the deploy started
+  await start($, clock)
+  world.executions.unshift(payDeploy('p13', 13, 'prod', 'Failed', T0 + 30_000, 'pay-13'))
+  await clock.advance(65_000); await clock.settle()
+  expect(world.asked.length).toBe(0)
+})
+
+test('CD-only without permission to read the connector: doctor says what it costs', async ($, on) => {
+  const { world, clock } = cdOnlyWorld(on, { surfaces: [] })
+  world.connector = { status: 403 }
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toContain("✗ Git connectors — 0/1 readable; can't read org.gh_payments (needs view on connectors), so services using them can't be matched to this repo")
+})
+
+test('CD-only doctor: names the services and the mode', async ($, on) => {
+  const { clock } = cdOnlyWorld(on, { surfaces: [] })
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(out.text).toContain('✓ Git connectors — 1 read to match service manifests to this repo')
+  expect(out.text).toContain('✓ Services from this repo — payments — CD-only repo: matched by manifests; pending manifest changes tracked per environment')
+})
+
+// ---------------------------------------------------------------- platform modules (through the Harness MCP server)
+
+// One response per module, shaped like each module's API as the Harness MCP server returns it
+const MODULE_DATA: Record<string, any> = {
+  gitops_application: { items: [
+    { name: 'bootcamp-prod', serviceRef: 'bootcampapp', envRef: 'prod', openInHarness: 'https://app.harness.io/ng/x', app: { status: { health: { status: 'Degraded' }, sync: { status: 'OutOfSync', revision: 'abc1234def567' } } } },
+    { name: 'api-dev', app: { status: { health: { status: 'Healthy' }, sync: { status: 'Synced' } } } },
+  ] },
+  security_issue: { issues: [
+    { title: 'CVE-2026-1234 in openssl', severityCode: 'Critical', targetName: 'bootcamp-app' },
+    { title: 'Hardcoded secret', severityCode: 'High', targetName: 'bootcamp-app' },
+    { title: 'Outdated lodash', severityCode: 'Low', targetName: 'other-repo' },
+  ] },
+  scs_artifact_source: [{ name: 'taskmanager images', artifact_type: { type: 'CONTAINER' } }, { _summary: { total: 1 } }],
+  fme_feature_flag: { objects: [{ name: 'new-checkout', rolloutStatus: { name: 'Ramping' } }, { name: 'dark-mode', killed: true }] },
+  alert: { items: [{ title: 'High error rate', status: 'Open', severity: 'P1', serviceName: 'bootcamp-app' }], total: 1 },
+  incident: null, // module not enabled in this account
+  registry: { items: [{ identifier: 'docker-prod', packageType: 'DOCKER', artifactsCount: 12 }] },
+  release: { items: [{ name: 'October release', status: 'Running' }] },
+  policy_evaluation: { items: [{ name: 'Require approval for prod' }] },
+  iacm_workspace: { items: [{ name: 'prod-network', status: 'failed', provisioner: 'terraform' }] },
+  idp_entity: { items: [{ name: 'bootcamp-app', owner: 'team-payments', lifecycle: 'production' }] },
+  cost_anomaly: { items: [{ resourceName: 'eks-prod', anomalousSpend: 1840, status: 'ACTIVE' }] },
+  database_schema: { items: [{ name: 'orders', type: 'Liquibase' }] },
+  chaos_experiment: { items: [{ name: 'pod-kill', recentExperimentRunDetails: [{ phase: 'Completed', resiliencyScore: 92 }] }] },
+}
+const modulesMcp = (t: string, a: any) => {
+  if (t !== 'harness_list' || !(a.resource_type in MODULE_DATA)) return { ok: true }
+  const d = MODULE_DATA[a.resource_type]
+  return d === null ? { isError: true, content: [{ type: 'text', text: 'Module CET not enabled for this account' }] } : d
+}
+
+test('modules: all 14 read through the local Harness MCP server when you use an API key', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const calls = world.mcpCalls.filter((c: any) => c.tool === 'harness_list')
+  expect(new Set(calls.map((c: any) => c.server))).toEqual(new Set(['plugin:harness-platform:harness-local']))
+  expect(calls.map((c: any) => c.args.resource_type).sort()).toEqual(Object.keys(MODULE_DATA).sort())
+  expect(calls[0].args).toMatchObject({ org_id: 'ORG', project_id: 'proj', compact: false })
+})
+
+test('modules: the pane shows what needs attention, worst first', async ($, on) => {
+  const { clock } = harnessWorld(on, { mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '⎈ 1 degraded app' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '· ⊛ 1 critical security issue' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '· ◉ 1 open alert' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^\+\d$/ })).toBeDefined() // more than four: "+N"
+})
+
+test('modules: the Platform hub lists every module, opens one, and says which are unavailable', async ($, on) => {
+  const { clock } = harnessWorld(on, { mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'modules' })
+  expect(await ui.find({ type: 'Text', text: /^── PLATFORM · 14 modules/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 apps · 1 degraded' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '3 issues · 1 critical · 1 high' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '2 flags · 1 killed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 workspace · 1 failed' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 experiment' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'not available: Module CET not enabled for this account' })).toBeDefined()
+  await ui.press({ key: 'mod-expand' }) // GitOps
+  expect(await ui.find({ type: 'Text', text: 'bootcamp-prod  Degraded · OutOfSync · abc1234' })).toBeDefined()
+  await ui.press({ key: 'mod-back' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+})
+
+test('modules: feature flags referenced in your change, with their rollout', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { mcp: modulesMcp })
+  world.diff = 'diff --git a/x b/x\n+++ b/x\n+  if (client.isOn("new-checkout")) {\n-  legacy()\n'
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '⚑ flags in your change: new-checkout (Ramping)' })).toBeDefined()
+})
+
+test('modules: production confirmations name critical security issues on this repo', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Retry', 'Cancel'], mcp: modulesMcp })
+  failHead(world)
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'actions' }); await ui.press({ key: 'act-retry' }); await clock.settle()
+  expect(world.asked[1]).toBe('This deploys to production (prod). ⚠ 1 critical security issue open on bootcamp-app. Are you sure?')
+})
+
+test('modules: the inventory shows each service\'s GitOps app and owner', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'inv-expand' })
+  expect(await ui.find({ type: 'Text', text: '    │ ⎈ GitOps bootcamp-prod (prod): Degraded · OutOfSync · abc1234' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '    │ owner: team-payments (catalog)' })).toBeDefined()
+})
+
+test('modules: Claude reads them through harness_status (view: modules)', async ($, on) => {
+  const { clock } = harnessWorld(on, { mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL, view: 'modules' })) as any).result)
+  expect(s.attention.slice(0, 2)).toEqual(['⎈ 1 degraded app', '⊛ 1 critical security issue'])
+  expect(s.modules.find((m: any) => m.module === 'Incidents')).toEqual({ module: 'Incidents', unavailable: 'Module CET not enabled for this account' })
+  expect(s.modules.find((m: any) => m.module === 'Cloud cost (CCM)').items[0]).toEqual({ name: 'eks-prod', status: 'warn', detail: '$1,840 · ACTIVE' })
+})
+
+test('modules: text mode and doctor', async ($, on) => {
+  const { clock } = harnessWorld(on, { mcp: modulesMcp, surfaces: [] })
+  await start($, clock); await clock.settle()
+  const t: any = await $.command.run({ command: 'harness', args: 'platform' })
+  expect(t.text).toContain('Needs attention: ⎈ 1 degraded app · ⊛ 1 critical security issue · ◉ 1 open alert · ⌂ 1 failed IaCM workspace')
+  expect(t.text).toContain('⊛ Security (STO): 3 issues · 1 critical · 1 high\n    ✗ CVE-2026-1234 in openssl — Critical · bootcamp-app')
+  const d: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(d.text).toContain('✓ GitOps — 2 apps · 1 degraded')
+  expect(d.text).toContain('· Incidents — not available: Module CET not enabled for this account')
+  expect(d.text).toContain('· Platform modules — through plugin:harness-platform:harness-local (local, with your API key; needs Node.js for npx)')
+})
+
+test('modules in sign-in mode go through the hosted server', async ($, on) => {
+  let w: any
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => (a.resource_type in MODULE_DATA ? modulesMcp(t, a) : mcpHarness(w)(t, a)) })
+  w = world
+  await start($, clock); await clock.settle()
+  const sec = world.mcpCalls.find((c: any) => c.args?.resource_type === 'security_issue')
+  expect(sec.server).toBe('plugin:harness-platform:harness')
+})
+
+test('capture: saves the shape of real responses with nothing identifying in it', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { mcp: modulesMcp, surfaces: [] })
+  await start($, clock); await clock.settle()
+  const out: any = await $.command.run({ command: 'harness', args: 'doctor --capture' })
+  expect(out.text).toMatch(/^Saved an anonymized capture to \/work\/harness-capture\.json/)
+  const text = world.writes[0].text
+  const snap = JSON.parse(text)
+  expect(Object.keys(snap.modules).length).toBe(14)
+  expect(snap.executions[0].status).toBe('Running') // enum values kept
+  for (const leak of ['dev@example.com', 'bootcamp', 'b0b0b0b0', 'Dev User', 'CVE-2026', 'team-payments', 'https://']) expect([leak, text.includes(leak)]).toEqual([leak, false])
+})
+
+// ---------------------------------------------------------------- home: suggestions + views
+
+const HOME_ENV = { HARNESS_API_KEY: 'pat.ACC123.tok.secret', HARNESS_DEFAULT_PROJECT_ID: 'proj', HARNESS_DEFAULT_ORG_ID: 'ORG' }
+
+test('home is where the pane opens, and spotlights a production deploy in progress', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── SUGGESTED NOW ─+$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^Production deploy in progress/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'CI CD #3 · bootcamp-app → prod · started 3m ago' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '     Build ✓ → Deploy prod ●' })).toBeDefined() // live stage progress
+  // e opens the run itself, selected, in the project view
+  await ui.press({ key: 'home-open' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES \(project\)/ })).toBeDefined()
+  expect(((await ui.find({ type: 'Text', text: /^CI CD #3 / })) as any).props.inverse).toBe(true)
+  await ui.press({ key: 'home' })
+  expect(await ui.find({ type: 'Text', text: /^── SUGGESTED NOW/ })).toBeDefined()
+})
+
+test('home: your failed commit and what needs you outrank the rest; at most three suggestions', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: HOME_ENV, mcp: modulesMcp })
+  failHead(world)
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const titles = (await ui.findAll({ type: 'Text' })).map((t: any) => t.text.trim()).filter((t: string) => /^(Your commit failed|Alerts on your service|GitOps app degraded|Critical security issue|Production deploy|Approval waiting)$/.test(t))
+  expect(titles).toEqual(['Your commit failed', 'Alerts on your service', 'GitOps app degraded'])
+})
+
+test('home: an approval waiting opens the approvals view', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: { ...HOME_ENV, HARNESS_CICD_ALLOW_ACTIONS: '1' } })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^Approval waiting/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'CI CD #3 → prod (expires in 2h 59m)' })).toBeDefined()
+  await ui.press({ key: 'home-open' })
+  expect(await ui.find({ type: 'Text', text: /^── APPROVALS WAITING · 1/ })).toBeDefined()
+  expect(await ui.find({ key: 'appr-ap1' })).toBeDefined()
+})
+
+test('home on a quiet day says so, and still offers every view with live badges', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: HOME_ENV })
+  world.executions[0].status = 'Success'; world.executions[0].layoutNodeMap.b.status = 'Success'
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '✓ All quiet: nothing is running in production, nothing needs you.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^── VIEWS ─+$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'CI CD #3 Success' })).toBeDefined() // Your change
+  expect(await ui.find({ type: 'Text', text: 'none waiting' })).toBeDefined() // Approvals
+  await ui.press({ key: 'view-deployments' }) // 2
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS/ })).toBeDefined()
+  await ui.press({ key: 'home' })
+  await ui.press({ key: 'view-service' }) // 4
+  expect(await ui.find({ type: 'Text', text: /^── BOOTCAMP-APP/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^dev ✗ 1-dev .*─▶  ★ prod ✓ 3-dev/ })).toBeDefined()
+})
+
+test('home: Security, Operate and Platform open the modules for that purpose', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV, mcp: modulesMcp })
+  await start($, clock); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '⊛ 3 issues · 1 critical · 1 high · ≣ 1 artifact source · § 1 policy' })).toBeDefined()
+  await ui.press({ key: 'view-secure' })
+  expect(await ui.find({ type: 'Text', text: /^── SECURE · 3 modules/ })).toBeDefined()
+  await ui.press({ key: 'home' })
+  await ui.press({ key: 'view-operate' })
+  expect(await ui.find({ type: 'Text', text: /^── OPERATE · 3 modules/ })).toBeDefined()
+})
+
+test('a production deploy starting is announced, pointing at home', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.executions[0].status = 'Success'
+  await start($, clock)
+  world.executions[0].status = 'Running'
+  await clock.advance(65_000)
+  expect(world.toasts).toContain('● Production deploy started: CI CD #3 → bootcamp-app (o to watch)')
+})
+
+test('start_view: you can still open on runs', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: { ...HOME_ENV, HARNESS_PLATFORM_START: 'runs' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+})
+
+// ---------------------------------------------------------------- starting screen preference
+
+test('starting screen: s in any view makes it where the pane opens, and it is remembered', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: HOME_ENV })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(((await ui.find({ key: 'start-here' })) as any).props.label).toBe('★ start screen') // Home is the default
+  await ui.press({ key: 'view-deployments' })
+  expect(((await ui.find({ key: 'start-here' })) as any).props.label).toBe('Start here')
+  await ui.press({ key: 'start-here' })
+  expect(world.store.get('start_view')).toBe('inventory')
+  expect(world.toasts.at(-1)).toBe('Harness will open on Deployments (o for Home).')
+  expect(((await ui.find({ key: 'start-here' })) as any).props.label).toBe('★ start')
+})
+
+test('starting screen: the saved choice is used next session', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: HOME_ENV, store: { start_view: 'inventory' } })
+  world.cdRuns = cdHistory()
+  await start($, clock); await clock.advance(2000); await clock.settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── DEPLOYMENTS \(whole project\)/ })).toBeDefined()
+})
+
+test('starting screen: approvals', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV, store: { start_view: 'approvals' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── APPROVALS/ })).toBeDefined()
+})
+
+test('starting screen: service', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV, store: { start_view: 'service' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── BOOTCAMP-APP/ })).toBeDefined()
+})
+
+test('starting screen: platform', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV, store: { start_view: 'platform' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── PLATFORM · 14 modules/ })).toBeDefined()
+})
+
+test('starting screen: /harness start sets it; /harness reopens on it', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: HOME_ENV, surfaces: [] })
+  await start($, clock)
+  expect(((await $.command.run({ command: 'harness', args: 'start' })) as any).text).toBe('Starting screen: Home. Choose one with /harness start <home|runs|inventory|approvals|service|platform>, or press s in any view.')
+  expect(((await $.command.run({ command: 'harness', args: 'start change' })) as any).text).toBe('Harness will open on Your change.')
+  expect(world.store.get('start_view')).toBe('runs')
+  const d: any = await $.command.run({ command: 'harness', args: 'doctor' })
+  expect(d.text).toContain('· Starting screen — Your change (s in any view, or /harness start)')
+})
+
+test('starting screen: /harness brings you back to it after wandering', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: HOME_ENV })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'view-change' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+  await $.command.run({ command: 'harness', args: '' })
+  expect(await ui.find({ type: 'Text', text: /^── SUGGESTED NOW/ })).toBeDefined()
+})
+
+test('starting screen: a filtered module view can\'t be one; the env variable beats the saved choice', async ($, on) => {
+  const { clock } = harnessWorld(on, { env: { ...HOME_ENV, HARNESS_PLATFORM_START: 'runs' }, store: { start_view: 'service' } })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
+  await ui.press({ key: 'home' }); await ui.press({ key: 'view-secure' })
+  expect(await ui.find({ key: 'start-here' })).toBeUndefined()
+})

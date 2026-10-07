@@ -1,0 +1,4 @@
+{
+  "description": "harness-platform hooks module",
+  "modules": ["./register.js"]
+}

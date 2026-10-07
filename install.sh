@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs the harness-cicd Claude Code mod from this folder.
+# Installs the harness-platform Claude Code mod from this folder.
 #   ./install.sh                      asks for org, project and API key (key input is hidden)
 #   HARNESS_API_KEY=… HARNESS_DEFAULT_ORG_ID=… HARNESS_DEFAULT_PROJECT_ID=… ./install.sh --yes
 # Re-running it updates the plugin and lets you change the settings.
@@ -38,6 +38,9 @@ for v in "$ORG" "$PROJECT"; do [[ "$v" =~ ^[A-Za-z0-9_-]+$ ]] || fail "IDs may c
 LAYOUT="${HARNESS_CICD_LAYOUT:-}"
 ask LAYOUT "Pane layout: stacked, focus, dock or strip" "stacked"
 [[ "$LAYOUT" =~ ^(stacked|focus|dock|strip)$ ]] || fail "Layout must be stacked, focus, dock or strip: '$LAYOUT'"
+START="${HARNESS_PLATFORM_START:-}"
+ask START "Start on: home, runs, inventory, approvals, service or platform" "home"
+[[ "$START" =~ ^(home|runs|inventory|approvals|service|platform)$ ]] || fail "Starting screen must be home, runs, inventory, approvals, service or platform: '$START'"
 ACTIONS="${HARNESS_CICD_ALLOW_ACTIONS:-}"
 if [ $YES -eq 0 ]; then
   read -r -p "Allow retry/rerun/abort/approve from the pane? Each asks before acting [y/N]: " a || true
@@ -72,28 +75,44 @@ else
   say "Adding marketplace harness-tools"
   claude plugin marketplace add "$DEST" >/dev/null
 fi
+# Upgrading from the plugin's old name: remove harness-cicd so only one /harness answers
 if claude plugin list 2>/dev/null | grep -q 'harness-cicd@harness-tools'; then
-  claude plugin update harness-cicd@harness-tools >/dev/null 2>&1 || true
+  say "Removing the old harness-cicd plugin (renamed to harness-platform)"
+  claude plugin uninstall harness-cicd@harness-tools >/dev/null 2>&1 || true
+fi
+if claude plugin list 2>/dev/null | grep -q 'harness-platform@harness-tools'; then
+  claude plugin update harness-platform@harness-tools >/dev/null 2>&1 || true
 else
-  say "Installing harness-cicd"
-  claude plugin install harness-cicd@harness-tools >/dev/null
+  say "Installing harness-platform"
+  claude plugin install harness-platform@harness-tools >/dev/null
 fi
 
 # 5. Save settings; the key goes to your OS credential store, not settings.json (and never on a command line)
-JSON="{\"org_id\":\"$ORG\",\"project_id\":\"$PROJECT\",\"base_url\":\"$BASE\",\"layout\":\"$LAYOUT\",\"allow_actions\":\"$ACTIONS_JSON\"${KEY:+,\"api_key\":\"$KEY\"}}"
-printf '%s' "$JSON" | claude plugin configure harness-cicd@harness-tools --values-stdin >/dev/null
+JSON="{\"org_id\":\"$ORG\",\"project_id\":\"$PROJECT\",\"base_url\":\"$BASE\",\"layout\":\"$LAYOUT\",\"start_view\":\"$START\",\"allow_actions\":\"$ACTIONS_JSON\"${KEY:+,\"api_key\":\"$KEY\"}}"
+printf '%s' "$JSON" | claude plugin configure harness-platform@harness-tools --values-stdin >/dev/null
 unset KEY JSON k
-say "Saved settings for $ORG/$PROJECT (layout: $LAYOUT, actions: $([ "$ACTIONS_JSON" = true ] && echo on || echo off))"
+say "Saved settings for $ORG/$PROJECT (start: $START, layout: $LAYOUT, actions: $([ "$ACTIONS_JSON" = true ] && echo on || echo off))"
+
+# 5b. Platform modules use Harness's MCP server; with an API key it runs locally through npx.
+#     Download it once now, so its first start in Claude Code doesn't hit the 30-second limit.
+if [ -n "${KEY:-}" ] || claude plugin configure harness-platform@harness-tools --json 2>/dev/null | grep -q '"api_key"'; then
+  if command -v npx >/dev/null; then
+    say "Preparing the local Harness MCP server (one-time download)…"
+    printf '' | timeout 180 npx -y harness-mcp-v2@3.2.32 >/dev/null 2>&1 || true
+  else
+    say "Note: platform modules with an API key need Node.js (npx). Install Node.js, or sign in with Harness instead."
+  fi
+fi
 
 # 6. Check it
-claude plugin list 2>/dev/null | grep -A4 'harness-cicd@harness-tools' | grep -q 'enabled' || fail "Installed but not enabled: run 'claude plugin enable harness-cicd@harness-tools'."
+claude plugin list 2>/dev/null | grep -A4 'harness-platform@harness-tools' | grep -q 'enabled' || fail "Installed but not enabled: run 'claude plugin enable harness-platform@harness-tools'."
 say "Testing the connection to Harness…"
 OUT="$(env -u HARNESS_API_KEY claude -p "/harness doctor" < /dev/null 2>&1 | tail -30 || true)"
 printf '%s\n' "$OUT" | sed 's/^/    /'
 case "$OUT" in
   *"refused the API key"*) fail "Installed, but Harness rejected the key. Check it has view access to $ORG/$PROJECT, then re-run to update it." ;;
-  *"not configured"*)      say "Installed. Add your API key with: /plugin configure harness-cicd@harness-tools" ;;
-  *"sign-in needed"*)      say "Installed. Sign in once: open Claude Code, run /mcp, choose plugin:harness-cicd:harness, then Authenticate. Check with /harness doctor." ;;
+  *"not configured"*)      say "Installed. Add your API key with: /plugin configure harness-platform@harness-tools" ;;
+  *"sign-in needed"*)      say "Installed. Sign in once: open Claude Code, run /mcp, choose plugin:harness-platform:harness, then Authenticate. Check with /harness doctor." ;;
   *"HTTP "*)               fail "Harness returned an error (above). Check the org/project IDs and URL, then re-run." ;;
   *)                       say "Done. Start Claude Code in a repo Harness builds and type /harness" ;;
 esac
