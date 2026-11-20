@@ -1521,6 +1521,8 @@ function renderProjects($, el, T, W) {
   const seen = new Set(recentRows.map(scopeId))
   const rows = [...recentRows.map((x) => ({ ...x, recent: true })), ...shown.filter((x) => !seen.has(scopeId(x)))]
   const MAX = 12
+  // The field only takes keys while it holds the focus ring, and a redraw can drop the ring; put it back (no-op where focus isn't ours to move)
+  const focusFilter = () => { try { $.ui.focus({ requestId: PANE, key: 'pick-filter' }).catch(() => {}) } catch {} }
   const pick = (x) => {
     if (sameScope(x, cur)) { view.mode = 'home'; redraw(); return }
     if (cfg.allow_actions) { view.pick.confirm = { org: x.org, project: x.project }; redraw(); return }
@@ -1529,6 +1531,7 @@ function renderProjects($, el, T, W) {
   const out = [section(T, W, 'SWITCH PROJECT'),
     Box({ flexDirection: 'row', columnGap: 3, children: [
       Button({ key: 'pick-back', label: 'Back', hotkey: 'o', plain: true, onPress: () => { view.mode = cfg.project_id ? 'home' : 'runs'; redraw() } }),
+      Button({ key: 'pick-filter-go', label: 'Filter', hotkey: 'f', plain: true, onPress: focusFilter }),
       Button({ key: 'pick-refresh', label: 'Refresh list', hotkey: 'r', plain: true, onPress: () => { fetchProjects($, true); redraw() } }),
     ] }),
   ]
@@ -1544,8 +1547,8 @@ function renderProjects($, el, T, W) {
     )
     return out
   }
-  // Typing in the field takes every key (Esc gives them back to the hotkeys); Enter switches when one project is left
-  if (Input) out.push(Input({ key: 'pick-filter', placeholder: 'filter by org, project or name', submitLabel: 'switch', value: f, onInput: (val) => { view.pick.filter = String(val ?? ''); redraw() }, onSubmit: (val) => { const m = fuzzyProjects(projects.list, String(val ?? '')); if (m.length === 1) pick(m[0]) } }))
+  // Press / (or click the field) to type; the field takes every key until Esc gives them back. Enter switches when one project is left
+  if (Input) out.push(Input({ key: 'pick-filter', placeholder: 'filter by org, project or name', submitLabel: 'switch', value: f, onInput: (val) => { view.pick.filter = String(val ?? ''); redraw(); focusFilter() }, onSubmit: (val) => { const m = fuzzyProjects(projects.list, String(val ?? '')); if (m.length === 1) pick(m[0]) } }))
   else out.push(T('Filter: /harness project <text>', { dimColor: true }))
   if (projects.loading && !projects.list.length) out.push(T('Loading projects…', { dimColor: true }))
   else if (projects.error && !projects.list.length) {
@@ -1557,8 +1560,7 @@ function renderProjects($, el, T, W) {
       key: 'pick-row-' + scopeId(x), flexDirection: 'row', columnGap: 1,
       children: [
         T(isCur ? '❯' : ' ', { color: 'blue' }),
-        Button({ key: 'pick-' + scopeId(x), label: i < 9 ? String(i + 1) : '·', ...(i < 9 ? { hotkey: String(i + 1) } : {}), plain: true, dimColor: true, onPress: () => { pick(x) } }),
-        T(pad(scopeId(x), Math.min(40, Math.max(18, W - 24))), { bold: true, inverse: false }),
+        Button({ key: 'pick-' + scopeId(x), label: pad(scopeId(x), Math.min(40, Math.max(18, W - 24))), ...(i < 9 ? { hotkey: String(i + 1) } : {}), plain: true, onPress: () => { pick(x) } }),
         T(fit(isCur ? 'watching now' : x.recent ? 'recent' : x.name !== x.project ? x.name : '', 24), { dimColor: !isCur, color: isCur ? 'green' : undefined }),
       ],
     }))
