@@ -508,6 +508,8 @@ Without settings, the pane shows what's missing:
 | Platform modules | through the hosted Harness MCP server | through Harness's MCP server running locally (`npx harness-mcp-v2`, needs **Node.js**), started by Claude Code with your key |
 | Step logs for diagnosis | through `harness_diagnose` | through the log service |
 
+**An MCP server is required, but either one works.** The platform modules and Claude's Harness tools run through MCP: the hosted server (`plugin:harness-platform:harness`) or the local one (`plugin:harness-platform:harness-local`, which uses your API key from the plugin's `api_key` setting or `HARNESS_API_KEY` in the shell that starts Claude Code). If your account blocks one (for example a "DCR Trusted hosts" policy rejecting hosted sign-in with a 403), use the other. `/mcp` shows which is connected.
+
 The account ID is read from the key, or from Harness's links in sign-in mode. With an API key, give it **view** access to pipelines and executions, services, environments, and freeze windows, plus Code repos for pull requests. For write actions, Harness's normal execute and approve permissions apply; the plugin never needs more than you have. A service-account key works; set `skip_user_lookup` so "runs you triggered" isn't attempted.
 
 ---
@@ -522,6 +524,7 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 | `/harness all` · `/harness mine` | open on the whole project / this repo |
 | `/harness refresh` | refresh now |
 | `/harness doctor` | read-only checks of everything |
+| `/harness project [org/project\|-]` | open the project picker, switch to a project, or go back (`--repo` remembers it for this repo, `--forget` clears it) |
 | `/harness start <view>` | choose the starting screen: `home` · `runs` · `inventory` · `approvals` · `service` · `platform` |
 | `/harness inventory` | every service × environment with its live version |
 | `/harness platform` | every Harness module, with what needs attention |

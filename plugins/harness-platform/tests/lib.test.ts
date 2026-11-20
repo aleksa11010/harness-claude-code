@@ -1,6 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 import {
   repoKey, accountFromKey, execCi, execRepoKeys, cdTargets, failureMessage, execUrl, buildView, toolSummary, statusKind, fit, ago,
+  parseProjects, resolveProject, pushRecent, parseGitHead,
 } from '../hooks/lib.js'
 import { executions, services, environments, T0 } from './fixtures.ts'
 
@@ -220,4 +221,50 @@ test('manifests: Git and Harness Code stores, list and folder paths, artifacts i
   expect(manifestInRepo({ connectorRef: 'r', repoName: '', paths: [] }, 'payments', new Map([['r', { url: 'https://github.com/acme/payments.git', type: 'Repo' }]]))).toBe(true)
   expect(manifestInRepo({ connectorRef: 'r', repoName: '', paths: [] }, 'payments', new Map())).toBe(false) // unknown connector: no guess
   expect(repoManifestPaths({ yaml: y }, 'charts', new Map())).toEqual(['charts/payments']) // runtime-expression paths skipped
+})
+
+
+test('parseProjects reads Harness NG and MCP shapes, sorted, without duplicates', () => {
+  const list = parseProjects([
+    { project: { identifier: 'b', name: 'Bee', orgIdentifier: 'o2' } },
+    { identifier: 'a', name: 'Aye', orgIdentifier: 'o1' },
+    { project: { identifier: 'a', orgIdentifier: 'o1' } },
+    { name: 'no identifier' },
+  ])
+  expect(list).toEqual([{ org: 'o1', project: 'a', name: 'Aye' }, { org: 'o2', project: 'b', name: 'Bee' }])
+})
+
+test('resolveProject: exact org/project, a unique bare name, the current org breaks a tie, else suggestions', () => {
+  const list = parseProjects([
+    { identifier: 'pay', orgIdentifier: 'o1' }, { identifier: 'pay', orgIdentifier: 'o2' }, { identifier: 'web', orgIdentifier: 'o1' }, { identifier: 'payments', orgIdentifier: 'o1' },
+  ])
+  expect(resolveProject('o2/pay', list, 'o1').match).toMatchObject({ org: 'o2', project: 'pay' })
+  expect(resolveProject('WEB', list, 'o2').match).toMatchObject({ org: 'o1', project: 'web' })
+  expect(resolveProject('pay', list, 'o2').match).toMatchObject({ org: 'o2' })
+  const amb = resolveProject('pay', list, 'other')
+  expect(amb.match).toBeNull()
+  expect(amb.matches.length).toBe(2)
+  expect(resolveProject('paym', list, 'o1').matches.map((x: any) => x.project)).toEqual(['payments'])
+  expect(resolveProject('nope', list, 'o1')).toEqual({ match: null, matches: [] })
+})
+
+test('resolveProject takes org/project as typed when the list is unavailable', () => {
+  expect(resolveProject('o9/x', [], 'o1').match).toMatchObject({ org: 'o9', project: 'x', unverified: true })
+  expect(resolveProject('x', [], 'o1').match).toBeNull()
+})
+
+test('pushRecent puts the newest first, drops repeats and caps the list', () => {
+  let r: any[] = []
+  for (const p of ['a', 'b', 'c', 'a']) r = pushRecent(r, { org: 'o', project: p }, 3)
+  expect(r.map((x) => x.project)).toEqual(['a', 'c', 'b'])
+  expect(pushRecent(r, { org: 'o', project: 'd' }, 3).map((x) => x.project)).toEqual(['d', 'a', 'c'])
+})
+
+test('parseGitHead: loose ref, packed ref, detached HEAD, unborn branch', () => {
+  const a = 'a'.repeat(40), b = 'b'.repeat(40)
+  expect(parseGitHead('ref: refs/heads/main\n', a + '\n', '')).toEqual({ branch: 'main', head: a })
+  expect(parseGitHead('ref: refs/heads/feat/x', '', `# pack-refs\n${b} refs/heads/other\n${a} refs/heads/feat/x\n`)).toEqual({ branch: 'feat/x', head: a })
+  expect(parseGitHead(b + '\n', '', '')).toEqual({ branch: null, head: b })
+  expect(parseGitHead('ref: refs/heads/new', '', '')).toEqual({ branch: 'new', head: null })
+  expect(parseGitHead('garbage', '', '')).toEqual({ branch: null, head: null })
 })

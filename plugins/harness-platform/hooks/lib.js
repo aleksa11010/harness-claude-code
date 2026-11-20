@@ -991,3 +991,76 @@ export function anonymize(v, key = '', depth = 0) {
   }
   return v
 }
+
+// ---- Projects: switching what the pane watches ----------------------------------
+
+export const scopeId = (s) => `${s.org}/${s.project}`
+
+// Projects from GET /ng/api/projects ({ project: {...} } items) or the MCP server's harness_list (flat items)
+export function parseProjects(items) {
+  const seen = new Set()
+  const out = []
+  for (const it of Array.isArray(items) ? items : []) {
+    const p = it?.project ?? it
+    const project = p?.identifier ?? p?.id
+    if (!project) continue
+    const org = String(p.orgIdentifier ?? p.org_id ?? p.org ?? 'default')
+    const id = org + '/' + project
+    if (seen.has(id)) continue
+    seen.add(id)
+    out.push({ org, project: String(project), name: String(p.name ?? project) })
+  }
+  return out.sort((a, b) => a.org.localeCompare(b.org) || a.project.localeCompare(b.project))
+}
+
+// "org/project", or a bare project identifier. `match` is set only when the answer is certain;
+// otherwise `matches` holds what to offer. With no list (not loaded, or unreadable) an org/project is taken as typed.
+export function resolveProject(text, list, currentOrg) {
+  const t = String(text ?? '').trim()
+  if (!t) return { match: null, matches: [] }
+  const lower = t.toLowerCase()
+  if (t.includes('/')) {
+    const [o, ...rest] = t.split('/')
+    const p = rest.join('/')
+    const exact = list.find((x) => x.org.toLowerCase() === o.toLowerCase() && x.project.toLowerCase() === p.toLowerCase())
+    if (exact) return { match: exact, matches: [exact] }
+    if (!list.length && o && p) return { match: { org: o, project: p, name: p, unverified: true }, matches: [] }
+    return { match: null, matches: fuzzyProjects(list, p || o) }
+  }
+  const exact = list.filter((x) => x.project.toLowerCase() === lower)
+  if (exact.length === 1) return { match: exact[0], matches: exact }
+  const inOrg = exact.filter((x) => x.org === currentOrg)
+  if (exact.length > 1 && inOrg.length === 1) return { match: inOrg[0], matches: exact }
+  return { match: null, matches: exact.length ? exact : fuzzyProjects(list, t) }
+}
+
+export function fuzzyProjects(list, text) {
+  const q = String(text ?? '').trim().toLowerCase()
+  if (!q) return list.slice()
+  const hit = (x) => (x.org + '/' + x.project + ' ' + x.name).toLowerCase()
+  return list.filter((x) => hit(x).includes(q))
+}
+
+// Most recent first, no duplicates
+export function pushRecent(recents, s, max = 8) {
+  const keep = (Array.isArray(recents) ? recents : []).filter((x) => x && !(x.org === s.org && x.project === s.project))
+  return [{ org: s.org, project: s.project }, ...keep].slice(0, max)
+}
+
+// ---- Git without a git binary (the desktop app has no $.process) ------------------
+
+// From the text of .git/HEAD, the loose ref it points at (if any) and .git/packed-refs:
+// the branch name and the commit HEAD is on. A detached HEAD holds the sha itself.
+export function parseGitHead(headText, refText, packedText) {
+  const h = String(headText ?? '').trim()
+  const m = /^ref:\s*refs\/heads\/(.+)$/.exec(h)
+  if (!m) return /^[0-9a-f]{40}$/i.test(h) ? { branch: null, head: h.toLowerCase() } : { branch: null, head: null }
+  const branch = m[1].trim()
+  const loose = String(refText ?? '').trim()
+  if (/^[0-9a-f]{40}$/i.test(loose)) return { branch, head: loose.toLowerCase() }
+  for (const line of String(packedText ?? '').split('\n')) {
+    const p = /^([0-9a-f]{40}) refs\/heads\/(.+)$/i.exec(line.trim())
+    if (p && p[2] === branch) return { branch, head: p[1].toLowerCase() }
+  }
+  return { branch, head: null } // an unborn branch
+}

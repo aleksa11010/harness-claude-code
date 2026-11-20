@@ -11,6 +11,8 @@ A Claude Code mod (plugin) that gives you one pane for Harness, scoped to the re
 
 Also: a status line under the prompt, toasts when your runs finish/fail/wait for approval, 10-second polling for 15 minutes after Claude runs `git push`, and a `harness_status` tool Claude can call.
 
+New in 0.12: **switch org and project** without restarting. Press **`g`** in the pane (or run `/harness project`) for a picker over every project your key or sign-in can see; `/harness project <org/project>` switches directly, `/harness project -` goes back, and `--repo` makes it the project this repo opens on (`--forget` clears that). A project other than the repo's is marked `⚠`, and auto-fix pauses there. **Local MCP:** the bundled `harness-local` server now uses `HARNESS_API_KEY` from your shell when the plugin's `api_key` setting is empty (a setting still wins). Hotkeys only work while the pane has focus: `ctrl+x tab`, a click, or open it with `/harness`.
+
 New in 0.11: **choose your starting screen** — Home, Your change, Deployments, Approvals, Service or Platform. Press `s` in any view ("Start here"), run `/harness start <view>`, or answer the installer; the choice is remembered and `/harness` reopens on it.
 
 New in 0.10: **Home**
@@ -21,6 +23,7 @@ New in 0.9: **Harness Platform**
 - **Renamed** from `harness-cicd` to `harness-platform`, because it now covers every Harness module.
 - **14 platform modules** through Harness's MCP server: GitOps, Security (STO), Supply chain (SCS), Feature flags (FME), Alerts, Incidents, Artifact registry, Releases, Policies (OPA), Infrastructure (IaCM), Catalog (IDP), Cloud cost (CCM), Database DevOps, Chaos. A Platform hub (`m`, `/harness platform`), an attention line in the pane and band, GitOps health and owners in the inventory, critical security issues named in production confirmations, and feature flags referenced in your change.
 - **Both connection modes:** the plugin bundles Harness's hosted MCP server (sign in) and a local `harness-mcp-v2` that Claude Code starts with your API key.
+- **You need one of the two MCP servers** for the platform modules and for Claude's own Harness tools (`harness_list`, `harness_get`, and so on). Use whichever fits: the **hosted** server (`/mcp` → `plugin:harness-platform:harness` → Authenticate) needs hosted MCP enabled and OAuth allowed for your account; the **local** server (`plugin:harness-platform:harness-local`) needs only an API key, set in the plugin's `api_key` setting or as `HARNESS_API_KEY` in the shell that starts Claude Code. If one is blocked (for example the hosted sign-in is rejected with a 403 by a "DCR Trusted hosts" policy), use the other. Run `/mcp` to see which is connected.
 - **`/harness capture`:** an anonymized snapshot of real responses, to tighten every module against your account.
 
 New in 0.8:

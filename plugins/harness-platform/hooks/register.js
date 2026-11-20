@@ -19,6 +19,7 @@ import {
   buildInventory, mergeRuns, inventoryCell, inventoryText, servicesInRepo, execRepoKeys,
   parseManifests, connectorScope, repoManifestPaths,
   MODULES, moduleItems, moduleSummary, attentionLine, flagsInDiff, anonymize,
+  scopeId, parseProjects, resolveProject, fuzzyProjects, pushRecent, parseGitHead,
 } from './lib.js'
 
 const PANE = 'harness'
@@ -54,7 +55,13 @@ const SIGN_IN = 'Harness sign-in needed: run /mcp, choose the Harness server, Au
 const LAYOUTS = ['stacked', 'focus', 'dock', 'strip']
 let layout = 'stacked'
 // Pane interaction state: selected run, expanded diagnosis cards, actions menu, dock tab
-const view = { selected: null, expanded: new Set(), collapsed: new Set(), menu: false, tab: 'runs', mode: 'runs', invSel: null, invOpen: new Set(), homeSel: 0, svcIdx: 0, modFilter: null, modFilterLabel: '' }
+const view = { selected: null, expanded: new Set(), collapsed: new Set(), menu: false, tab: 'runs', mode: 'runs', invSel: null, invOpen: new Set(), homeSel: 0, svcIdx: 0, modFilter: null, modFilterLabel: '', pick: { filter: '', confirm: null } }
+// Which org/project the pane watches. `scopeGen` counts switches so answers still in flight for the old project are dropped.
+let scopeGen = 0
+let homeScope = null // the org/project this session (or this repo) opens on
+let prevScope = null // for /harness project -
+let recents = [] // org/project pairs, newest first (persisted)
+const projects = { list: [], at: 0, error: '', loading: null }
 let seenProdRuns = null // production deploys already announced as started
 // Starting screens: setting < saved choice (s in the pane, /harness start) < HARNESS_PLATFORM_START
 const START_VIEWS = ['home', 'runs', 'inventory', 'approvals', 'service', 'platform']
@@ -138,12 +145,17 @@ async function readGit($) {
     const ht = await $.process.run(['git', 'log', '-1', '--format=%ct', 'HEAD'], { timeoutMs: 5000 })
     if (ht.exitCode === 0 && /^\d+$/.test(ht.stdout.trim())) headTime = Number(ht.stdout.trim()) * 1000
   } catch {
-    // $.process is CLI-only; in the Desktop app fall back to reading .git/HEAD
+    // $.process is CLI-only; in the Desktop app read git's own files: the branch and the commit HEAD is on
+    // (the commit's time and history need git itself, so those stay empty there)
     try {
-      const txt = await $.fs.read(repo.root + '/.git/HEAD')
-      const m = /ref: refs\/heads\/(.+)/.exec(String(txt))
-      if (m) branch = m[1].trim()
-    } catch { /* not a plain checkout */ }
+      const git = repo.root + '/.git'
+      const headText = String(await $.fs.read(git + '/HEAD'))
+      const ref = /^ref:\s*(refs\/heads\/.+)$/m.exec(headText)
+      const readOr = async (path) => { try { return String(await $.fs.read(path)) } catch { return '' } }
+      const got = parseGitHead(headText, ref ? await readOr(git + '/' + ref[1].trim()) : '', ref ? await readOr(git + '/packed-refs') : '')
+      branch = got.branch
+      head = got.head
+    } catch { /* not a plain checkout (a worktree's .git is a file) */ }
   }
   return {
     root: repo?.root ?? '', remote: repo?.remote ?? '',
@@ -156,11 +168,16 @@ async function readGit($) {
 
 // Callers that arrive mid-refresh wait for the same refresh instead of reading stale data
 function refresh($) {
-  if (!pending) pending = doRefresh($).finally(() => { pending = null })
+  if (!pending) {
+    const p = doRefresh($).finally(() => { if (pending === p) pending = null }) // a switch may have replaced it
+    pending = p
+  }
   return pending
 }
 
 async function doRefresh($) {
+  const gen = scopeGen
+  const stale = () => gen !== scopeGen // the person switched project while this was in flight: drop its answers
   lastAttempt = await $.clock.now()
   try {
     if (!cfg.project_id || (cfg.auth === 'key' && !cfg.account_id)) {
@@ -191,6 +208,7 @@ async function doRefresh($) {
       ])
       if (lookupUser) data.me = me ?? ''
     }
+    if (stale()) return
     data = {
       ...data,
       git,
@@ -202,17 +220,23 @@ async function doRefresh($) {
     failures = 0
     updatedAt = await $.clock.now()
     await fetchConnectors($)
+    if (stale()) return
     data.connectors = connectors
-    behind = await countBehind($)
+    const behindNow = await countBehind($)
+    if (stale()) return
+    behind = behindNow
     mergeRuns(inv.store, data.executions)
     await countPendingChanges($)
+    if (stale()) return
     const modsInUse = cfg.module_attention || view.mode === 'home' || updatedAt - mods.usedAt < 30 * 60_000
     if (modsInUse && updatedAt - mods.at >= cfg.modules_poll_ms) fetchModules($) // background
     const inUse = updatedAt - inv.usedAt < 30 * 60_000
     if (inUse && updatedAt - inv.scannedAt >= INV_RESCAN_MS) scanInventory($) // background; the pane redraws when done
     await Promise.all([fetchApprovals($), fetchFreeze($), fetchPr($)])
+    if (stale()) return
     notify($)
   } catch (err) {
+    if (stale()) return
     failures++
     error = String(err?.message ?? err)
     $.ui.status('harness: ' + fit(error, 80))
@@ -224,6 +248,7 @@ async function doRefresh($) {
 // ---- Freeze windows (every 5 minutes) --------------------------------------------------
 
 async function fetchFreeze($) {
+  const gen = scopeGen
   const now = await $.clock.now()
   if (freezeAt && now - freezeAt < 5 * 60_000) return
   freezeAt = now
@@ -240,6 +265,7 @@ async function fetchFreeze($) {
       harness($, 'POST', '/ng/api/freeze/list', { page: '0', size: '50' }, { filterType: 'FreezeSetup', freezeStatus: 'Enabled' }).catch(() => null),
     ])
   }
+  if (gen !== scopeGen) return
   freeze = g || l ? parseFreeze(g, l, now) : null
 }
 
@@ -378,23 +404,30 @@ const pendingText = (n) => (n === 0 ? 'up to date' : `${n} change${n === 1 ? '' 
 // ---- Platform modules ---------------------------------------------------------------------
 
 function fetchModules($) {
-  if (!mods.fetching) mods.fetching = doFetchModules($).finally(() => { mods.fetching = null; $.ui.invalidate('ui.render') })
+  if (!mods.fetching) {
+    const p = doFetchModules($).finally(() => { if (mods.fetching === p) mods.fetching = null; $.ui.invalidate('ui.render') })
+    mods.fetching = p
+  }
   return mods.fetching
 }
 
 async function doFetchModules($) {
+  const gen = scopeGen
   mods.at = await $.clock.now()
   const enabled = MODULES.filter((m) => cfg.modules.includes(m.id))
   await Promise.all(enabled.map(async (m) => {
     try {
       const j = await mcp($, 'harness_list', { compact: false, ...m.args })
       const raw = moduleItems(j)
+      if (gen !== scopeGen) return
       mods.raw.set(m.id, raw.slice(0, 2))
       mods.results.set(m.id, { items: raw.map(m.item).filter((x) => x.name), at: mods.at, error: '' })
     } catch (err) {
+      if (gen !== scopeGen) return
       mods.results.set(m.id, { items: null, at: mods.at, error: fit(String(err?.message ?? err).replace(/^Harness sign-in needed.*?\[/, '[').replace(/^\[|\]$/g, ''), 120) })
     }
   }))
+  if (gen !== scopeGen) return
   await findChangeFlags($)
 }
 
@@ -426,11 +459,15 @@ const securityNote = () => { const sec = repoSecurity(); return sec.critical ? `
 // ---- Deployment inventory scan ---------------------------------------------------------------
 
 function scanInventory($) {
-  if (!inv.scanning) inv.scanning = doScanInventory($).finally(() => { inv.scanning = null; $.ui.invalidate('ui.render') })
+  if (!inv.scanning) {
+    const p = doScanInventory($).finally(() => { if (inv.scanning === p) inv.scanning = null; $.ui.invalidate('ui.render') })
+    inv.scanning = p
+  }
   return inv.scanning
 }
 
 async function doScanInventory($) {
+  const gen = scopeGen
   const now = await $.clock.now()
   const cutoff = now - cfg.inventory_days * 86400_000
   let fetched = 0
@@ -439,6 +476,7 @@ async function doScanInventory($) {
       const batch = cfg.auth === 'mcp'
         ? mcpItems(await mcp($, 'harness_list', { resource_type: 'execution', filters: { module: 'CD' }, page, size: 100, compact: false }))
         : (await harness($, 'POST', '/pipeline/api/pipelines/execution/summary', { module: 'CD', page: String(page), size: '100' }, { filterType: 'PipelineExecution' }))?.content ?? []
+      if (gen !== scopeGen) return
       if (!batch.length) break
       mergeRuns(inv.store, batch)
       fetched += batch.length
@@ -449,6 +487,7 @@ async function doScanInventory($) {
     inv.scannedAt = now
     inv.error = ''
   } catch (err) {
+    if (gen !== scopeGen) return
     inv.error = fit(String(err?.message ?? err), 140)
   }
 }
@@ -511,14 +550,13 @@ async function runInputs($, x) {
 
 async function fetchApprovalsFor($, x) {
   const id = x.planExecutionId
+  const gen = scopeGen
+  const keep = (list) => { if (gen === scopeGen) approvals.set(id, list); return list } // not into another project's state
   if (cfg.auth === 'mcp') {
     try {
-      const list = parseApprovals(mcpItems(await mcp($, 'harness_list', { resource_type: 'approval_instance', filters: { execution_id: id, approval_status: 'WAITING' }, compact: false })))
-      approvals.set(id, list)
-      return list
+      return keep(parseApprovals(mcpItems(await mcp($, 'harness_list', { resource_type: 'approval_instance', filters: { execution_id: id, approval_status: 'WAITING' }, compact: false }))))
     } catch {
-      approvals.set(id, [])
-      return []
+      return keep([])
     }
   }
   try {
@@ -527,12 +565,9 @@ async function fetchApprovalsFor($, x) {
         `?approval_status=WAITING&accountIdentifier=${encodeURIComponent(cfg.account_id)}`,
       { headers: { 'x-api-key': cfg.api_key, 'Harness-Account': cfg.account_id, Accept: 'application/json' } },
     )
-    const list = res.ok ? parseApprovals(JSON.parse(res.text)) : []
-    approvals.set(id, list)
-    return list
+    return keep(res.ok ? parseApprovals(JSON.parse(res.text)) : [])
   } catch {
-    approvals.set(id, [])
-    return []
+    return keep([])
   }
 }
 
@@ -731,8 +766,10 @@ async function onYourFailure($, x, manifestChange = false) {
   if (layout === 'strip') await openPane($, false) // strip-first: the pane appears when it matters
   const diag = cfg.diagnose !== 'off' ? await diagnose($, x) : null
   const d = diag?.state === 'done' ? diag : null
-  if (cfg.on_failure === 'notify') return
-  if (cfg.on_failure === 'auto') {
+  // Runs in a project this repo doesn't open on aren't this repo's pushes: ask instead of fixing on its own
+  const onFailure = cfg.scope_away && cfg.on_failure === 'auto' ? 'ask' : cfg.on_failure
+  if (onFailure === 'notify') return
+  if (onFailure === 'auto') {
     const n = (fixAttempts.get(key) ?? 0) + 1
     if (n > cfg.auto_fix_attempts) {
       $.ui.toast(`Auto-fix stopped after ${cfg.auto_fix_attempts} attempts on ${x.name ?? x.pipelineIdentifier}. Over to you.`, { timeoutMs: 10000 })
@@ -793,7 +830,7 @@ function notify($) {
     }
   }
   seenApprovals = ids
-  $.ui.status('harness: ' + (parts.join(' · ') || 'all clear') + (v.scopeFellBack ? (v.mineBasis === 'me' ? ' (your runs)' : ' (project)') : ''))
+  $.ui.status('harness' + (cfg.scope_away ? ' ' + scopeLabel() : '') + ': ' + (parts.join(' · ') || 'all clear') + (v.scopeFellBack ? (v.mineBasis === 'me' ? ' (your runs)' : ' (project)') : ''))
 
   const prodRunning = data.executions.filter((x) => statusKind(x.status) === 'run' && cdTargets(x).some((t) => t.envType === 'Production'))
   if (seenProdRuns) for (const x of prodRunning) if (!seenProdRuns.has(x.planExecutionId)) $.ui.toast(`● Production deploy started: ${runName(x)} → ${[...new Set(cdTargets(x).filter((t) => t.envType === 'Production').map((t) => t.serviceName))].join(', ')} (o to watch)`, { timeoutMs: 10000 })
@@ -873,6 +910,19 @@ export function register(on, options) {
     cfg.auth = cfg.api_key ? 'key' : 'mcp'
     // Modules use the bundled server that matches how you connect: local with your key, hosted when signed in
     if (!cfg.mcp_server) cfg.mcp_server = cfg.auth === 'key' ? 'plugin:harness-platform:harness-local' : 'plugin:harness-platform:harness'
+    // Which project: the one this repo remembers, else the settings; with neither, the one used last
+    try {
+      const r = await $.store.get('recent_projects')
+      if (Array.isArray(r)) recents = r.filter((x) => x?.org && x?.project).slice(0, 8)
+      const map = await $.store.get('repo_projects')
+      if (map && typeof map === 'object' && Object.keys(map).length) {
+        const saved = map[(await readGit($))?.name]
+        if (saved?.org && saved?.project) { cfg.org_id = saved.org; cfg.project_id = saved.project; cfg.org_explicit = true }
+      }
+    } catch { /* nothing remembered */ }
+    if (!cfg.project_id && recents[0]) { cfg.org_id = recents[0].org; cfg.project_id = recents[0].project; cfg.org_explicit = true }
+    homeScope = cfg.project_id ? scopeOf() : null
+    cfg.scope_away = false
     // Preferences saved from the pane (layout, auto-fix) win over the settings defaults…
     layout = cfg.layout
     try {
@@ -907,7 +957,7 @@ export function register(on, options) {
     await $.tool.register({
       name: 'harness_status',
       description:
-        'Live Harness CI/CD state for the configured project, scoped to the git repo and branch of this session: ' +
+        'Live Harness CI/CD state for the project the person is watching (they switch with /harness project), scoped to the git repo and branch of this session: ' +
         'whether HEAD has been built, recent pipeline runs (status, branch, commit, failure reason, link), ' +
         'what version of each service is deployed to each environment, and the environments. ' +
         'Call it before or after pushing, deploying, or when the user asks about builds, pipelines or deployments.',
@@ -920,7 +970,7 @@ export function register(on, options) {
         },
       },
     })
-    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[start|platform|inventory|doctor|capture|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
+    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[project|start|platform|inventory|doctor|capture|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
     if (cfg.auto_open && layout !== 'strip') await openPane($, false)
     return next(e)
   })
@@ -928,6 +978,7 @@ export function register(on, options) {
   on('command.run', { command: 'harness' }, async ($, e) => {
     const raw = String(e.args || '').trim()
     const arg = raw.toLowerCase()
+    if (/^projects?(\s|$)/.test(arg)) return projectCommand($, raw)
     if (arg === 'all' || arg === 'mine') scope = arg
     if (!arg) {
       view.mode = modeFor(cfg.start_view)
@@ -1138,13 +1189,14 @@ export function register(on, options) {
     if (!cfg.add_context || !updatedAt || error || !wantsContext(e.text)) return next(e)
     const pend = [...pendingChanges].filter(([, n]) => n > 0).map(([k, n]) => { const [svc, env] = k.split('\u0000'); return `${data.services.find((x) => x.identifier === svc)?.name ?? svc}→${env}: ${n} manifest change${n === 1 ? '' : 's'} not deployed` })
     const line = contextLine(buildView(data, 'mine'), { behind, diagnoses, pr: [pr ? prLine(pr) : '', isCdOnly() ? 'CD-only repo (manifests here, no build in Harness)' : '', ...pend].filter(Boolean).join('; '), freeze: freeze?.frozen ? freezeText(freeze) : '' })
-    return line ? next({ ...e, context: [...(e.context ?? []), line] }) : next(e)
+    const scoped = line && cfg.scope_away ? `${line} (Harness is showing ${scopeLabel()}, not this repo's ${scopeId(homeScope)})` : line
+    return scoped ? next({ ...e, context: [...(e.context ?? []), scoped] }) : next(e)
   })
 
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
     if (e.requestId !== PANE) return next(e)
     const el = $.ui.resolve(e)
-    return renderPane($, el, e.props ?? {}, await $.clock.now())
+    return renderPane($, el, { ...(e.props ?? {}), surface: e.surface }, await $.clock.now())
   })
 
   // The band above the prompt: your commit, a sparkline of recent runs, prod lag
@@ -1306,6 +1358,218 @@ async function act($, kind, x) {
   }
 }
 
+// ---- Switching project ----------------------------------------------------------------------
+
+const scopeOf = () => ({ org: cfg.org_id, project: cfg.project_id })
+const sameScope = (a, b) => Boolean(a && b && a.org === b.org && a.project === b.project)
+const scopeLabel = () => (cfg.project_id ? scopeId(scopeOf()) : 'no project')
+
+// Everything read from the old project goes: a leftover would be shown, or acted on, as the new one's.
+// What belongs to the repo and the person (git, pull request, who you are) stays.
+function resetScopeState() {
+  data = { executions: [], services: [], environments: [], git: data.git, me: data.me }
+  error = null; updatedAt = 0; pending = null; lastAttempt = 0; failures = 0; burstUntil = 0; prevKinds = null
+  diagnoses.clear(); diagRuns.clear(); fixAttempts.clear(); approvals.clear()
+  seenApprovals = null; seenProdRuns = null; freeze = null; freezeAt = 0
+  behind = null; behindByCommit = new Map()
+  inv.store = new Map(); inv.scannedAt = 0; inv.usedAt = 0; inv.scanning = null; inv.runs = 0; inv.error = ''
+  connectors.clear(); connectorsAt = 0; pendingChanges = new Map(); pendingCache.clear(); changeFlags = { head: '', names: [] }
+  mods.results = new Map(); mods.raw = new Map(); mods.at = 0; mods.fetching = null
+  Object.assign(view, { selected: null, menu: false, invSel: null, homeSel: 0, svcIdx: 0, modFilter: null, modFilterLabel: '', modOpen: undefined, modSel: undefined })
+  view.expanded.clear(); view.collapsed.clear(); view.invOpen.clear()
+}
+
+// Switch what the pane watches. `remember` makes it the project this repo opens on.
+async function switchScope($, target, opts = {}) {
+  const to = { org: target.org, project: target.project }
+  if (sameScope(to, scopeOf())) return false
+  if (cfg.project_id) prevScope = scopeOf()
+  scopeGen++
+  cfg.org_id = to.org
+  cfg.project_id = to.project
+  cfg.org_explicit = true
+  if (opts.remember) homeScope = to
+  cfg.scope_away = Boolean(homeScope) && !sameScope(to, homeScope)
+  resetScopeState()
+  recents = pushRecent(recents, to)
+  try { await $.store.set('recent_projects', recents) } catch { /* not persisted */ }
+  if (opts.remember) await rememberForRepo($, to)
+  view.mode = 'home'
+  view.pick = { filter: '', confirm: null }
+  $.ui.status(`harness: switching to ${scopeId(to)}…`)
+  $.ui.invalidate('ui.render')
+  await refresh($)
+  return true
+}
+
+// repo name → { org, project }: the project a repo opens on
+async function rememberForRepo($, to) {
+  const key = data.git?.name
+  if (!key) return false
+  try {
+    const map = { ...((await $.store.get('repo_projects')) ?? {}) }
+    if (to) map[key] = to
+    else delete map[key]
+    await $.store.set('repo_projects', map)
+    return true
+  } catch { return false }
+}
+
+function fetchProjects($, force) {
+  if (!projects.loading && (force || !projects.at)) {
+    const p = doFetchProjects($).finally(() => { if (projects.loading === p) projects.loading = null; $.ui.invalidate('ui.render') })
+    projects.loading = p
+  }
+  return projects.loading ?? Promise.resolve()
+}
+
+// Every project the key or sign-in can see, across orgs
+async function doFetchProjects($) {
+  try {
+    let items = []
+    if (cfg.auth === 'mcp') {
+      items = mcpItems(await mcp($, 'harness_list', { resource_type: 'project', org_id: undefined, project_id: undefined, size: 200, compact: false }))
+    } else {
+      for (let page = 0; page < 10; page++) {
+        const d = await harness($, 'GET', '/ng/api/projects', { pageIndex: String(page), pageSize: '200', hasModule: 'false', orgIdentifier: null, projectIdentifier: null })
+        const c = d?.content ?? []
+        items.push(...c)
+        if (c.length < 200) break
+      }
+    }
+    projects.list = parseProjects(items)
+    projects.error = ''
+    projects.at = await $.clock.now()
+  } catch (err) {
+    projects.error = fit(String(err?.message ?? err), 140)
+    projects.at = 0 // try again next time it is opened
+  }
+}
+
+function openPicker($, filter = '') {
+  view.mode = 'projects'
+  view.pick = { filter, confirm: null }
+  fetchProjects($, false)
+  $.ui.invalidate('ui.render')
+}
+
+function projectsText() {
+  const L = [`Harness is watching ${scopeLabel()}${cfg.scope_away ? ` (this repo opens on ${scopeId(homeScope)})` : ''}.`]
+  if (projects.error) L.push(`Couldn't list projects: ${projects.error}`)
+  if (recents.length) L.push('Recent: ' + recents.map(scopeId).join(', '))
+  if (projects.list.length) {
+    L.push(`Projects (${projects.list.length}):`, ...projects.list.slice(0, 40).map((x) => `  ${scopeId(x)}${x.name !== x.project ? ' — ' + x.name : ''}`))
+    if (projects.list.length > 40) L.push(`  …and ${projects.list.length - 40} more: /harness project <text> filters`)
+  }
+  L.push('Switch: /harness project <org/project>  ·  back: /harness project -  ·  this repo opens on it: add --repo  ·  --forget clears')
+  return L.join('\n')
+}
+
+async function projectCommand($, raw) {
+  const words = raw.replace(/^projects?\s*/i, '').split(/\s+/).filter(Boolean)
+  const flags = new Set(words.filter((w) => w.startsWith('--')).map((w) => w.toLowerCase()))
+  const text = words.filter((w) => !w.startsWith('--')).join(' ')
+  const surfaces = await $.session.surfaces()
+  const drawn = surfaces.some((x) => x === 'terminal' || x === 'desktop')
+  if (flags.has('--forget')) {
+    const ok = await rememberForRepo($, null)
+    homeScope = cfg.project_id ? scopeOf() : null
+    cfg.scope_away = false
+    $.ui.invalidate('ui.render')
+    return { text: ok ? 'Harness: this repo no longer has a remembered project.' : 'Harness: not in a git repo, nothing to forget.' }
+  }
+  if (!text) {
+    await fetchProjects($, false)
+    if (!drawn) return { text: projectsText() }
+    openPicker($)
+    await openPane($, true)
+    return {}
+  }
+  let target
+  if (text === '-') {
+    if (!prevScope) return { text: 'Harness: no earlier project in this session.' }
+    target = prevScope
+  } else {
+    await fetchProjects($, false)
+    const r = resolveProject(text, projects.list, cfg.org_id)
+    if (!r.match) {
+      if (drawn && r.matches.length) { openPicker($, text); await openPane($, true); return {} }
+      const hint = r.matches.length ? ` Did you mean: ${r.matches.slice(0, 6).map(scopeId).join(', ')}?` : projects.error ? ` (couldn't list projects: ${projects.error} — use org/project)` : ''
+      return { text: `Harness: no project "${text}".${hint}` }
+    }
+    target = r.match
+  }
+  const remember = flags.has('--repo')
+  const changed = await switchScope($, target, { remember })
+  if (!changed && remember) { homeScope = scopeOf(); cfg.scope_away = false; await rememberForRepo($, scopeOf()) }
+  const note = cfg.allow_actions && changed ? ' Write actions are ON and now apply to this project.' : ''
+  const away = cfg.scope_away ? ` Not this repo's project (${scopeId(homeScope)}): auto-fix is paused. Add --repo to make it this repo's.` : ''
+  return {
+    text: `${changed ? 'Harness: now watching' : 'Harness: already watching'} ${scopeLabel()}${remember ? ' (remembered for this repo)' : ''}.${note}${away}` +
+      (error && error !== 'not configured' ? `\nCouldn't read it: ${error}` : ''),
+  }
+}
+
+function renderProjects($, el, T, W) {
+  const { Box, Button, Input } = el
+  const redraw = () => $.ui.invalidate('ui.render')
+  const cur = scopeOf()
+  const f = view.pick.filter
+  const byId = new Map(projects.list.map((x) => [scopeId(x), x]))
+  const shown = fuzzyProjects(projects.list, f)
+  const recentRows = recents.map((r) => byId.get(scopeId(r)) ?? { ...r, name: r.project }).filter((x) => !f || fuzzyProjects([x], f).length)
+  const seen = new Set(recentRows.map(scopeId))
+  const rows = [...recentRows.map((x) => ({ ...x, recent: true })), ...shown.filter((x) => !seen.has(scopeId(x)))]
+  const MAX = 12
+  const pick = (x) => {
+    if (sameScope(x, cur)) { view.mode = 'home'; redraw(); return }
+    if (cfg.allow_actions) { view.pick.confirm = { org: x.org, project: x.project }; redraw(); return }
+    switchScope($, x).then(() => $.ui.toast(`Harness: now watching ${scopeLabel()}`, { timeoutMs: 5000 }))
+  }
+  const out = [section(T, W, 'SWITCH PROJECT'),
+    Box({ flexDirection: 'row', columnGap: 3, children: [
+      Button({ key: 'pick-back', label: 'Back', hotkey: 'o', plain: true, onPress: () => { view.mode = cfg.project_id ? 'home' : 'runs'; redraw() } }),
+      Button({ key: 'pick-refresh', label: 'Refresh list', hotkey: 'r', plain: true, onPress: () => { fetchProjects($, true); redraw() } }),
+    ] }),
+  ]
+  const c = view.pick.confirm
+  if (c) {
+    out.push(
+      T(fit(`Switch to ${scopeId(c)}? Write actions are ON: retry, abort and approve will act on it.`, W), { color: 'yellow' }),
+      Box({ flexDirection: 'row', columnGap: 3, children: [
+        Button({ key: 'pick-yes', label: 'Switch', hotkey: 'y', plain: true, onPress: () => { view.pick.confirm = null; switchScope($, c).then(() => $.ui.toast(`Harness: now watching ${scopeLabel()}`, { timeoutMs: 5000 })) } }),
+        Button({ key: 'pick-ro', label: 'Switch, actions off', hotkey: 'w', plain: true, onPress: () => { cfg.allow_actions = false; view.pick.confirm = null; switchScope($, c).then(() => $.ui.toast(`Harness: now watching ${scopeLabel()}, write actions off`, { timeoutMs: 6000 })) } }),
+        Button({ key: 'pick-no', label: 'Stay', hotkey: 'n', plain: true, onPress: () => { view.pick.confirm = null; redraw() } }),
+      ] }),
+    )
+    return out
+  }
+  // Typing in the field takes every key (Esc gives them back to the hotkeys); Enter switches when one project is left
+  if (Input) out.push(Input({ key: 'pick-filter', placeholder: 'filter by org, project or name', submitLabel: 'switch', value: f, onInput: (val) => { view.pick.filter = String(val ?? ''); redraw() }, onSubmit: (val) => { const m = fuzzyProjects(projects.list, String(val ?? '')); if (m.length === 1) pick(m[0]) } }))
+  else out.push(T('Filter: /harness project <text>', { dimColor: true }))
+  if (projects.loading && !projects.list.length) out.push(T('Loading projects…', { dimColor: true }))
+  else if (projects.error && !projects.list.length) {
+    out.push(T(fit('⚠ Couldn\'t list projects: ' + projects.error, W), { color: 'red' }), T('Switch by name instead: /harness project <org/project>', { dimColor: true }))
+  }
+  rows.slice(0, MAX).forEach((x, i) => {
+    const isCur = sameScope(x, cur)
+    out.push(Box({
+      key: 'pick-row-' + scopeId(x), flexDirection: 'row', columnGap: 1,
+      children: [
+        T(isCur ? '❯' : ' ', { color: 'blue' }),
+        Button({ key: 'pick-' + scopeId(x), label: i < 9 ? String(i + 1) : '·', ...(i < 9 ? { hotkey: String(i + 1) } : {}), plain: true, dimColor: true, onPress: () => { pick(x) } }),
+        T(pad(scopeId(x), Math.min(40, Math.max(18, W - 24))), { bold: true, inverse: false }),
+        T(fit(isCur ? 'watching now' : x.recent ? 'recent' : x.name !== x.project ? x.name : '', 24), { dimColor: !isCur, color: isCur ? 'green' : undefined }),
+      ],
+    }))
+  })
+  if (rows.length > MAX) out.push(T(`+${rows.length - MAX} more: type to filter`, { dimColor: true }))
+  if (!rows.length && projects.at) out.push(T(f ? `No project matches "${f}".` : 'No projects found for this account.', { dimColor: true }))
+  const home = data.git?.name ? ` · this repo opens on ${homeScope ? scopeId(homeScope) : 'nothing remembered'}` : ''
+  out.push(T(fit(`${projects.list.length} projects${home}`, W), { dimColor: true }))
+  return out
+}
+
 function renderPane($, el, props, now) {
   const { Box, Button, Link } = el
   const T = mkT(el.Text)
@@ -1313,14 +1577,19 @@ function renderPane($, el, props, now) {
   const docked = props.placement === 'dock'
   const narrow = W < 70
   const right = `${freeze?.frozen ? freezeText(freeze) + ' · ' : ''}${cfg.on_failure === 'auto' ? 'auto-fix on · ' : ''}` +
-    (error === 'not configured' ? 'setup needed' : updatedAt ? `${narrow ? '' : 'updated '}${ago(updatedAt, now)}${now < burstUntil ? ' · watching' : ''}` : 'loading…')
-  const header = Box({
+    (error === 'not configured' ? 'setup needed' : updatedAt ? `${narrow ? '' : 'updated '}${ago(updatedAt, now)}${now < burstUntil ? ' · watching' : ''}` : 'loading…') +
+    (props.isFocused === false && !narrow && props.surface === 'terminal' ? ' · ctrl+x tab: keys' : '') // terminal hotkeys only work while the pane has focus; the desktop's buttons click
+  const headRow = Box({
     flexDirection: 'row', justifyContent: 'space-between',
     children: [
-      T(fit(`Harness · ${cfg.org_id}/${cfg.project_id}`, Math.max(12, W - Array.from(right).length - 2)), { bold: true }),
+      T(fit(`Harness · ${cfg.scope_away ? '⚠ ' : ''}${cfg.org_id}/${cfg.project_id}`, Math.max(12, W - Array.from(right).length - 2)), { bold: true, color: cfg.scope_away ? 'yellow' : undefined }),
       T(right, { dimColor: true }),
     ],
   })
+  const header = cfg.scope_away
+    ? Box({ flexDirection: 'column', children: [headRow, T(fit(`Not this repo's project (${scopeId(homeScope)}): auto-fix is paused. /harness project - goes back`, W), { color: 'yellow', dimColor: true })] })
+    : headRow
+  if (view.mode === 'projects') return Box({ flexDirection: 'column', children: [header, ...renderProjects($, el, T, W)] })
   if (error === 'not configured') {
     return Box({
       flexDirection: 'column',
@@ -1333,6 +1602,7 @@ function renderPane($, el, props, now) {
         T('    or set an API key (PAT or service-account token, read access)'),
         T('Account ID is read from the key. Env vars HARNESS_API_KEY, HARNESS_DEFAULT_PROJECT_ID', { dimColor: true }),
         T('and HARNESS_DEFAULT_ORG_ID (same as the Harness MCP server) also work.', { dimColor: true }),
+        ...(cfg.api_key || cfg.auth === 'mcp' ? [Button({ key: 'choose-project', label: 'Choose a project…', hotkey: 'g', plain: true, onPress: () => { openPicker($) } })] : []),
       ],
     })
   }
@@ -1350,6 +1620,7 @@ function renderPane($, el, props, now) {
       // Compact labels when docked or narrow, so the row never overflows
       Button({ key: 'scope-mine', label: narrow ? 'Repo' : 'This repo', hotkey: '1', plain: true, dimColor: scope !== 'mine', onPress: () => { scope = 'mine'; redraw() } }),
       Button({ key: 'scope-all', label: narrow ? 'Project' : 'Whole project', hotkey: '2', plain: true, dimColor: scope !== 'all', onPress: () => { scope = 'all'; redraw() } }),
+      Button({ key: 'switch', label: narrow ? 'Project…' : 'Switch project', hotkey: 'g', plain: true, onPress: () => { openPicker($) } }),
       Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => { refresh($) } }),
       Button({ key: 'modules', label: view.mode === 'modules' ? (narrow ? 'Runs' : 'Back to runs') : 'Platform', hotkey: 'm', plain: true, onPress: () => { if (view.mode === 'modules') { view.mode = 'runs' } else { view.mode = 'modules'; view.modFilter = null; mods.usedAt = updatedAt; if (!mods.at) fetchModules($) } redraw() } }),
       Button({ key: 'inventory', label: view.mode === 'inventory' ? (narrow ? 'Runs' : 'Back to runs') : 'Inventory', hotkey: 'i', plain: true, onPress: () => { if (view.mode === 'inventory') { view.mode = 'runs'; redraw() } else { openInventory($) } } }),
@@ -1362,6 +1633,7 @@ function renderPane($, el, props, now) {
     const startHere = Button({ key: 'start-here', label: cfg.start_view === 'home' ? '★ start screen' : 'Start here', hotkey: 's', plain: true, dimColor: cfg.start_view === 'home', onPress: () => { setStartView($, 'home') } })
     const homeControls = Box({ flexDirection: 'row', columnGap: 3, children: [
       startHere,
+      Button({ key: 'switch', label: narrow ? 'Project…' : 'Switch project', hotkey: 'g', plain: true, onPress: () => { openPicker($) } }),
       Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => { refresh($); mods.at = 0; fetchModules($) } }),
       Button({ key: 'layout', label: narrow ? layout : `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
       ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: narrow ? 'Harness' : 'open in Harness' })] : []),
@@ -1699,7 +1971,7 @@ function renderBand($, el, props, now) {
   const h = v.branch?.headRun
   const head = v.branch
     ? h ? kindText(T, h.status, `${v.branch.name}@${short(v.branch.head)} ${h.status} #${h.runSequence}`) : T(`· ${v.branch.name}@${short(v.branch.head)} not built yet`, { color: 'yellow' })
-    : T(`harness ${cfg.project_id}: ${v.counts.running} running · ${v.counts.failed} failed`)
+    : T(`harness ${cfg.scope_away ? scopeLabel() : cfg.project_id}: ${v.counts.running} running · ${v.counts.failed} failed`)
   const spark = sparkRuns(v.executions, 20).map((g) => T(SPARK[g.kind].repeat(g.count), { color: COLOR[g.kind] }))
   return Box({
     flexDirection: 'row', columnGap: 2,

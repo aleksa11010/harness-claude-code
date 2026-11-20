@@ -16,7 +16,7 @@ const PANE = {
 const ENV = { HARNESS_API_KEY: 'pat.ACC123.tok.secret', HARNESS_DEFAULT_PROJECT_ID: 'proj', HARNESS_DEFAULT_ORG_ID: 'ORG', HARNESS_PLATFORM_START: 'runs' }
 
 // Stubs for everything the mod asks Claude Code for. `world` lets a test change Harness's answers.
-function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?: number; surfaces?: string[]; slowMs?: number; answer?: string | string[]; model?: string; behind?: string; store?: Record<string, unknown>; remote?: string; mcp?: (tool: string, args: any) => any } = {}) {
+function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?: number; surfaces?: string[]; slowMs?: number; answer?: string | string[]; model?: string; behind?: string; store?: Record<string, unknown>; remote?: string; mcp?: (tool: string, args: any) => any; noProcess?: boolean; files?: Record<string, string> } = {}) {
   const world = {
     executions: structuredClone(executions) as any[],
     requests: [] as { url: string; init?: any }[],
@@ -50,6 +50,8 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     diff: '' as string, // `git diff --unified=0 @{upstream}...HEAD`
     writes: [] as { path: string; text: string }[],
     mcpCalls: [] as any[],
+    projectList: [] as any[], // GET /ng/api/projects, across orgs
+    byProject: {} as Record<string, any[]>, // runs per projectIdentifier; others get `executions`
   }
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, opts.env ?? ENV)
@@ -79,7 +81,9 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     const out = opts.mcp(e.tool, e.args)
     return { value: out?.isError ? out : { content: [{ type: 'text', text: JSON.stringify(out) }], isError: false } }
   })
+  on('fs.read', ($: any, e: any) => { if (opts.files && e.path in opts.files) return { value: opts.files[e.path] }; throw new Error('ENOENT ' + e.path) })
   on('process.run', ($: any, e: any) => {
+    if (opts.noProcess) throw new Error('$.process is CLI only')
     const cmd = e.argv.join(' ')
     if (cmd === 'git rev-parse --abbrev-ref HEAD') return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
     if (cmd === 'git rev-parse HEAD') return { value: { exitCode: 0, stdout: 'b0b0b0b0b0b0b0b0\n', stderr: '' } }
@@ -103,7 +107,8 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
       const page = Number(new URL(e.url).searchParams.get('page') || 0)
       return ok({ content: world.cdRuns.slice(page * 100, page * 100 + 100) })
     }
-    if (e.url.includes('/pipeline/api/pipelines/execution/summary')) return ok({ content: world.executions })
+    if (e.url.includes('/pipeline/api/pipelines/execution/summary')) return ok({ content: world.byProject[new URL(e.url).searchParams.get('projectIdentifier') ?? ''] ?? world.executions })
+    if (e.url.includes('/ng/api/projects')) return ok({ content: world.projectList })
     if (e.url.includes('/ng/api/servicesV2')) return ok({ content: [...services, ...world.extraServices] })
     if (e.url.includes('/ng/api/connectors/')) return world.connector?.status === 200 ? ok(world.connector.data) : { value: { status: world.connector?.status ?? 404, ok: false, headers: {}, text: JSON.stringify({ message: 'denied' }) } }
     if (e.url.includes('/ng/api/environmentsV2')) return ok({ content: environments })
@@ -1583,4 +1588,193 @@ test('starting screen: a filtered module view can\'t be one; the env variable be
   expect(await ui.find({ type: 'Text', text: /^── PIPELINES/ })).toBeDefined()
   await ui.press({ key: 'home' }); await ui.press({ key: 'view-secure' })
   expect(await ui.find({ key: 'start-here' })).toBeUndefined()
+})
+
+
+// ---- Switching project ------------------------------------------------------------------
+
+const PROJECTS = [
+  { project: { identifier: 'proj', name: 'Proj', orgIdentifier: 'ORG' } },
+  { project: { identifier: 'other', name: 'Other project', orgIdentifier: 'ORG2' } },
+  { project: { identifier: 'payments', name: 'Payments', orgIdentifier: 'ORG' } },
+]
+
+test('/harness project <org/project> switches: new scope on every request, nothing left from the old project', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.projectList = PROJECTS
+  world.byProject = { other: [] }
+  await start($, clock)
+  expect((await $.command.run({ command: 'harness', args: '' }) as any).text).toContain('Deploy dev')
+  const before = world.requests.length
+  const out: any = await $.command.run({ command: 'harness', args: 'project ORG2/other' })
+  expect(out.text).toContain('now watching ORG2/other')
+  const after = world.requests.slice(before).filter((r) => r.url.includes('/execution/summary'))
+  expect(after.length).toBeGreaterThan(0)
+  for (const r of after) {
+    expect(r.url).toContain('orgIdentifier=ORG2')
+    expect(r.url).toContain('projectIdentifier=other')
+  }
+  const text = ((await $.command.run({ command: 'harness', args: '' })) as any).text
+  expect(text).toContain('ORG2/other')
+  expect(text).not.toContain('Deploy dev')
+  expect(world.store.get('recent_projects')).toEqual([{ org: 'ORG2', project: 'other' }])
+})
+
+test('/harness project accepts a bare project name and suggests when it is not one', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.projectList = PROJECTS
+  await start($, clock)
+  expect((await $.command.run({ command: 'harness', args: 'project other' }) as any).text).toContain('now watching ORG2/other')
+  const miss: any = await $.command.run({ command: 'harness', args: 'project paym' })
+  expect(miss.text).toContain('no project "paym"')
+  expect(miss.text).toContain('ORG/payments')
+  const back: any = await $.command.run({ command: 'harness', args: 'project -' })
+  expect(back.text).toContain('now watching ORG/proj')
+})
+
+test('/harness project with no argument lists projects where nothing draws', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.projectList = PROJECTS
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'project' })
+  expect(out.text).toContain('watching ORG/proj')
+  expect(out.text).toContain('ORG2/other')
+})
+
+test('/harness project opens the focused picker in the terminal', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.projectList = PROJECTS
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'project' })
+  expect(out).toEqual({})
+  expect(world.opened.at(-1)).toMatchObject({ id: 'harness', focus: true })
+})
+
+test('--repo remembers the project for this repo, and the next session opens on it', async ($, on) => {
+  const first = harnessWorld(on, { surfaces: [] })
+  first.world.projectList = PROJECTS
+  await start($, first.clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'project ORG2/other --repo' })
+  expect(out.text).toContain('remembered for this repo')
+  expect(out.text).not.toContain('auto-fix is paused')
+  expect(first.world.store.get('repo_projects')).toEqual({ 'bootcamp-app': { org: 'ORG2', project: 'other' } })
+})
+
+test('a session opens on the project its repo remembers, over the settings', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [], store: { repo_projects: { 'bootcamp-app': { org: 'ORG2', project: 'other' } } } })
+  await start($, clock)
+  const urls = world.requests.map((r) => r.url).filter((u) => u.includes('/execution/summary'))
+  expect(urls[0]).toContain('orgIdentifier=ORG2')
+  expect(urls[0]).toContain('projectIdentifier=other')
+})
+
+test('a project other than the repo\'s pauses auto-fix and shows in the scope', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [] })
+  world.projectList = PROJECTS
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'project other' })
+  expect(out.text).toContain("Not this repo's project (ORG/proj): auto-fix is paused")
+  expect(world.statuses.at(-1)).toContain('ORG2/other')
+})
+
+test('an answer still in flight for the old project is dropped after a switch', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [], slowMs: 2000 })
+  world.byProject = { other: [] }
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: '/work' })
+  await clock.advance(600) // the first refresh is waiting on Harness for the old project
+  const cmd = $.command.run({ command: 'harness', args: 'project ORG2/other' })
+  await clock.advance(10000)
+  expect(((await cmd) as any).text).toContain('now watching ORG2/other')
+  await clock.advance(10000)
+  const text = ((await $.command.run({ command: 'harness', args: '' })) as any).text
+  expect(text).toContain('ORG2/other')
+  expect(text).not.toContain('Deploy dev')
+})
+
+test('--forget clears what the repo remembered', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: [], store: { repo_projects: { 'bootcamp-app': { org: 'ORG', project: 'proj' } } } })
+  await start($, clock)
+  const out: any = await $.command.run({ command: 'harness', args: 'project --forget' })
+  expect(out.text).toContain('no longer has a remembered project')
+  expect(world.store.get('repo_projects')).toEqual({})
+})
+
+test('the pane: g opens the picker, a row switches, and the header shows the new scope', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.projectList = PROJECTS
+  world.byProject = { other: [] }
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ key: 'switch' }) as any)?.props?.hotkey).toBe('g')
+  await ui.press({ key: 'switch' })
+  await clock.advance(100)
+  expect(await ui.find({ type: 'Text', text: /SWITCH PROJECT/ })).toBeDefined()
+  expect(await ui.find({ key: 'pick-ORG2/other' })).toBeDefined()
+  await ui.press({ key: 'pick-ORG2/other' })
+  await clock.advance(1000)
+  expect(await ui.find({ type: 'Text', text: /Harness · ⚠ ORG2\/other/ })).toBeDefined()
+  expect(world.toasts.at(-1)).toBe('Harness: now watching ORG2/other')
+  await ui.unmount()
+})
+
+test('the pane: with write actions on, switching asks first, and can turn actions off', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: { ...ENV, HARNESS_CICD_ALLOW_ACTIONS: '1' } })
+  world.projectList = PROJECTS
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'switch' })
+  await clock.advance(100)
+  await ui.press({ key: 'pick-ORG2/other' })
+  expect(await ui.find({ type: 'Text', text: /Switch to ORG2\/other\? Write actions are ON/ })).toBeDefined()
+  expect(world.toasts.length).toBe(0) // not switched yet
+  await ui.press({ key: 'pick-ro' })
+  await clock.advance(1000)
+  expect(world.toasts.at(-1)).toContain('write actions off')
+  await ui.unmount()
+})
+
+test('the pane: unfocused, it says how to get the hotkeys', async ($, on) => {
+  const { clock } = harnessWorld(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: false }, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /ctrl\+x tab: keys/ })).toBeDefined()
+  await ui.unmount()
+  const focused = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await focused.find({ type: 'Text', text: /ctrl\+x tab: keys/ })).toBeUndefined()
+  await focused.unmount()
+})
+
+test('desktop: the same picker and switch, and no terminal-only key hint', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { surfaces: ['desktop'] })
+  world.projectList = PROJECTS
+  world.byProject = { other: [] }
+  await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+  await clock.advance(600)
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, isFocused: false }, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /ctrl\+x tab/ })).toBeUndefined()
+  await ui.press({ key: 'switch' })
+  await clock.advance(100)
+  await ui.press({ key: 'pick-ORG2/other' })
+  await clock.advance(1000)
+  expect(await ui.find({ type: 'Text', text: /Harness · ⚠ ORG2\/other/ })).toBeDefined()
+  const out: any = await $.command.run({ command: 'harness', args: 'project' })
+  expect(out).toEqual({}) // drawn, not text
+  await ui.unmount()
+})
+
+test('desktop has no $.process: the branch and HEAD come from git\'s own files', async ($, on) => {
+  const sha = 'abcdef0123456789abcdef0123456789abcdef01'
+  const { clock } = harnessWorld(on, { surfaces: ['desktop'], noProcess: true, files: { '/work/.git/HEAD': 'ref: refs/heads/feature/x\n', '/work/.git/packed-refs': `# pack-refs\n${sha} refs/heads/feature/x\n` } })
+  await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+  await clock.advance(600)
+  const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
+  expect(s.git).toEqual({ repo: 'bootcamp-app', branch: 'feature/x', head: sha.slice(0, 7) })
+})
+
+test('desktop: a loose ref wins over packed-refs', async ($, on) => {
+  const loose = '1111111111111111111111111111111111111111'
+  const a = harnessWorld(on, { surfaces: ['desktop'], noProcess: true, files: { '/work/.git/HEAD': 'ref: refs/heads/main\n', '/work/.git/refs/heads/main': loose + '\n', '/work/.git/packed-refs': '2222222222222222222222222222222222222222 refs/heads/main\n' } })
+  await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+  await a.clock.advance(600)
+  expect(JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result).git).toEqual({ repo: 'bootcamp-app', branch: 'main', head: '1111111' })
 })

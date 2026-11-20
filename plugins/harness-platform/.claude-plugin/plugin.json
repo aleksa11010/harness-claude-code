@@ -1,7 +1,7 @@
 {
   "name": "harness-platform",
   "displayName": "Harness Platform",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Harness inside Claude Code: CI/CD, deployments, approvals, GitOps, security, feature flags, incidents, cost and every other Harness module, in one pane, with guardrails for Claude",
   "author": {
     "name": "Your Team"
@@ -21,7 +21,7 @@
     "api_key": {
       "type": "string",
       "title": "Harness API key",
-      "description": "PAT or service-account token with read access. Leave empty to sign in with Harness instead: /mcp \u2192 plugin:harness-platform:harness \u2192 Authenticate",
+      "description": "PAT or service-account token with read access. Leave empty to use HARNESS_API_KEY from your shell, or sign in with Harness instead: /mcp → plugin:harness-platform:harness → Authenticate",
       "sensitive": true
     },
     "project_id": {
@@ -84,7 +84,7 @@
     "on_failure": {
       "type": "string",
       "title": "When your commit fails",
-      "description": "notify: toast only \u00b7 ask: offer to let Claude fix it \u00b7 auto: Claude fixes and pushes again, up to the attempt limit",
+      "description": "notify: toast only · ask: offer to let Claude fix it · auto: Claude fixes and pushes again, up to the attempt limit",
       "options": [
         "notify",
         "ask",
@@ -103,7 +103,7 @@
     "push_guard": {
       "type": "string",
       "title": "Pushing while red",
-      "description": "hold: ask before Claude pushes onto a failing build \u00b7 warn: toast and push \u00b7 off",
+      "description": "hold: ask before Claude pushes onto a failing build · warn: toast and push · off",
       "options": [
         "hold",
         "warn",
@@ -120,7 +120,7 @@
     "diagnose": {
       "type": "string",
       "title": "Failure diagnosis",
-      "description": "auto: diagnose failures as they appear \u00b7 on_demand: only when you press diagnose \u00b7 off. Uses a small model on your plan",
+      "description": "auto: diagnose failures as they appear · on_demand: only when you press diagnose · off. Uses a small model on your plan",
       "options": [
         "auto",
         "on_demand",
@@ -137,7 +137,7 @@
     "layout": {
       "type": "string",
       "title": "Pane layout",
-      "description": "stacked \u00b7 focus (branch-first) \u00b7 dock (sidebar in wide fullscreen terminals) \u00b7 strip (band only; pane opens when something fails). Press v in the pane to switch",
+      "description": "stacked · focus (branch-first) · dock (sidebar in wide fullscreen terminals) · strip (band only; pane opens when something fails). Press v in the pane to switch",
       "options": [
         "stacked",
         "focus",
@@ -205,7 +205,7 @@
     "module_attention": {
       "type": "boolean",
       "title": "Platform attention line",
-      "description": "Refresh modules in the background and show what needs attention (failing GitOps apps, critical security issues, open alerts\u2026)",
+      "description": "Refresh modules in the background and show what needs attention (failing GitOps apps, critical security issues, open alerts…)",
       "default": true
     },
     "modules_poll_minutes": {
@@ -237,16 +237,17 @@
       "url": "https://mcp.harness.io/mcp"
     },
     "harness-local": {
-      "command": "npx",
+      "command": "sh",
       "args": [
-        "-y",
-        "harness-mcp-v2@3.2.32"
+        "-c",
+        "[ -n \"$HP_KEY\" ] && export HARNESS_API_KEY=\"$HP_KEY\"; [ -z \"$HARNESS_API_KEY\" ] && [ -n \"$HP_SHELL_KEY\" ] && export HARNESS_API_KEY=\"$HP_SHELL_KEY\"; [ -n \"$HP_ORG\" ] && export HARNESS_ORG=\"$HP_ORG\"; [ -n \"$HP_PROJECT\" ] && export HARNESS_PROJECT=\"$HP_PROJECT\"; [ -n \"$HP_URL\" ] && export HARNESS_BASE_URL=\"$HP_URL\"; exec npx -y harness-mcp-v2@3.2.32"
       ],
       "env": {
-        "HARNESS_API_KEY": "${user_config.api_key}",
-        "HARNESS_DEFAULT_ORG_ID": "${user_config.org_id}",
-        "HARNESS_DEFAULT_PROJECT_ID": "${user_config.project_id}",
-        "HARNESS_BASE_URL": "${user_config.base_url}"
+        "HP_KEY": "${user_config.api_key}",
+        "HP_ORG": "${user_config.org_id}",
+        "HP_PROJECT": "${user_config.project_id}",
+        "HP_URL": "${user_config.base_url}",
+        "HP_SHELL_KEY": "${HARNESS_API_KEY:-}"
       }
     }
   },
