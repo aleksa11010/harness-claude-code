@@ -584,53 +584,92 @@ async function fetchApprovals($) {
 
 const waitingList = () => data.executions.flatMap((x) => (approvals.get(x.planExecutionId) ?? []).map((a) => ({ x, a })))
 
-async function decideApproval($, x, a, action) {
+// Decides one waiting approval, always after asking the person. `opts.comment`: text to send with it ('' = the default note); left out, the person is asked for one.
+// Returns what happened, in a sentence, for a command or a tool to report.
+async function decideApproval($, x, a, action, opts = {}) {
+  let outcome = 'Not done.'
   const name = runName(x)
   if (!cfg.allow_actions) {
     $.ui.toast('Actions are off. Turn on "allow_actions" in /plugin configure harness-platform@harness-tools.', { timeoutMs: 8000 })
-    return
+    return 'Not done: write actions are off (the person must turn on allow_actions in /plugin configure harness-platform@harness-tools).'
   }
   if (a.type !== 'HarnessApproval') {
     $.ui.toast(`${name} is waiting on a ${approvalWhere(a.type)} approval: decide it there.`, { timeoutMs: 8000 })
-    return
+    return `Not done: ${name} is waiting on a ${approvalWhere(a.type)} approval, which can only be decided there.`
   }
   const verb = action === 'APPROVE' ? 'Approve' : 'Reject'
   const prod = [...new Set(cdTargets(x).filter((t) => t.envType === 'Production').map((t) => t.envName))]
   if (action === 'APPROVE' && prod.length && freeze?.frozen) {
     $.ui.toast(`${freezeText(freeze)}: not approving ${name} to deploy to production. Harness blocks it unless you can override the freeze.`, { timeoutMs: 10000 })
-    return
+    return `Not done: ${freezeText(freeze)}, so ${name} can't be approved to deploy to production.`
   }
   const inputs = []
+  let comment = opts.comment === undefined ? undefined : String(opts.comment).trim()
   try {
     const msg = fit(a.message.replace(/\s+/g, ' ').replace(/[?.!\s]+$/, ''), 100) // the question adds its own "?"
-    if ((await $.ui.ask(`${verb} ${name}${msg ? `: "${msg}"` : ''}?`, [verb, 'Cancel'])) !== verb) return
+    if ((await $.ui.ask(`${verb} ${name}${msg ? `: "${msg}"` : ''}?`, [verb, 'Cancel'])) !== verb) return `Not done: the person chose not to ${verb.toLowerCase()} ${name}.`
     if (action === 'APPROVE') {
       for (const i of a.inputs.slice(0, 5)) {
         // Pick the default, or type a value under "Other"
         const v = await $.ui.ask(`Value for "${i.name}"?`, i.default ? [i.default, 'Cancel'] : ['Leave empty', 'Cancel'])
-        if (v === 'Cancel') return
+        if (v === 'Cancel') return `Not done: the person cancelled at the input "${i.name}".`
         inputs.push({ name: i.name, value: v === 'Leave empty' ? '' : v })
       }
-      if (prod.length && (await $.ui.ask(`This lets ${name} deploy to production (${prod.join(', ')}).${securityNote()} Approve it?`, ['Yes, approve for production', 'Cancel'])) !== 'Yes, approve for production') return
+      if (prod.length && (await $.ui.ask(`This lets ${name} deploy to production (${prod.join(', ')}).${securityNote()} Approve it?`, ['Yes, approve for production', 'Cancel'])) !== 'Yes, approve for production') return `Not done: the person declined to approve ${name} for production.`
+    }
+    if (comment === undefined) {
+      // Free text goes under "Other"; the comment is kept in Harness's approval history
+      const c = await $.ui.ask(`Comment for the ${verb.toLowerCase()}? Choose "No comment", or "Other" to type one.`, ['No comment', 'Cancel'])
+      if (c === 'Cancel') return `Not done: the person cancelled before sending the ${verb.toLowerCase()}.`
+      comment = c === 'No comment' ? '' : String(c ?? '').trim()
     }
   } catch {
-    return // dismissed, or nobody to ask
+    return 'Not done: nobody could be asked to confirm (it was dismissed, or no one is at the keyboard).'
   }
   try {
     if (cfg.auth === 'mcp') {
-      const b = approvalBody(action, inputs)
+      const b = approvalBody(action, inputs, comment)
       await mcp($, 'harness_execute', { resource_type: 'approval_instance', action: action === 'APPROVE' ? 'approve' : 'reject', params: { approval_id: a.id }, body: { comments: b.comments, ...(inputs.length ? { approver_inputs: inputs } : {}) }, confirm: true })
     } else {
-      await harness($, 'POST', `/pipeline/api/approvals/${encodeURIComponent(a.id)}/harness/activity`, {}, approvalBody(action, inputs))
+      await harness($, 'POST', `/pipeline/api/approvals/${encodeURIComponent(a.id)}/harness/activity`, {}, approvalBody(action, inputs, comment))
     }
     $.ui.toast(`✓ ${action === 'APPROVE' ? 'Approved' : 'Rejected'} ${name}`, { timeoutMs: 6000 })
+    outcome = `${action === 'APPROVE' ? 'Approved' : 'Rejected'} ${name}${comment ? ` with the comment "${fit(comment, 80)}"` : ''}.`
     approvals.set(x.planExecutionId, (approvals.get(x.planExecutionId) ?? []).filter((y) => y.id !== a.id))
     burstUntil = (await $.clock.now()) + BURST_MS
     $.clock.after(3000, () => { refresh($) })
   } catch (err) {
     $.ui.toast(`✗ Couldn't ${verb.toLowerCase()} ${name}: ${fit(String(err?.message ?? err), 140)}`, { timeoutMs: 10000 })
+    outcome = `Failed: Harness refused to ${verb.toLowerCase()} ${name}: ${fit(String(err?.message ?? err), 140)}`
   }
   $.ui.invalidate('ui.render')
+  return outcome
+}
+
+// Which waiting approval a command or a tool means: by run number (12 or #12), execution id, or pipeline name; the only one waiting when none is given
+async function findWaiting($, ref) {
+  if (!lastAttempt || pending) await refresh($)
+  const all = waitingList()
+  const label = ({ x, a }) => `${runName(x)} (run #${x.runSequence}, id ${String(x.planExecutionId).slice(0, 8)})${a.message ? ': ' + fit(a.message.replace(/\s+/g, ' '), 60) : ''}`
+  if (!all.length) return { text: 'No approval is waiting in ' + scopeLabel() + '.' }
+  const r = String(ref ?? '').trim().replace(/^#/, '').toLowerCase()
+  const hit = r ? all.filter(({ x }) => String(x.runSequence) === r || String(x.planExecutionId).toLowerCase().startsWith(r) || String(x.pipelineIdentifier).toLowerCase() === r || runName(x).toLowerCase().includes(r)) : all
+  if (hit.length === 1) return { found: hit[0] }
+  const lines = (hit.length ? hit : all).map((w) => '  ' + label(w)).join('\n')
+  return { text: (hit.length ? 'More than one approval matches. Say which with its run number:\n' : `Nothing waiting matches "${ref}". Waiting:\n`) + lines }
+}
+
+// "/harness approve 12 looks good": the run is optional when only one approval is waiting; the rest of the line is the comment
+async function approvalCommand($, raw) {
+  const m = /^(approve|reject)\b\s*(.*)$/is.exec(raw)
+  const action = m[1].toLowerCase() === 'approve' ? 'APPROVE' : 'REJECT'
+  let rest = m[2].trim()
+  let ref = ''
+  const first = /^(#?\d+|[A-Za-z0-9_-]{8,})\b\s*(.*)$/s.exec(rest)
+  if (first && (/^#?\d+$/.test(first[1]) || waitingList().some(({ x }) => String(x.planExecutionId).toLowerCase().startsWith(first[1].toLowerCase()) || String(x.pipelineIdentifier).toLowerCase() === first[1].toLowerCase()))) { ref = first[1]; rest = first[2].trim() }
+  const w = await findWaiting($, ref)
+  if (!w.found) return { text: w.text }
+  return { text: await decideApproval($, w.found.x, w.found.a, action, rest ? { comment: rest } : {}) }
 }
 
 // From the actions menu: the run's waiting approval (asks which, if several)
@@ -968,12 +1007,15 @@ export function register(on, options) {
         type: 'object',
         properties: {
           scope: { type: 'string', enum: ['mine', 'all'], description: '"mine" (default): this repo/branch; "all": whole project' },
+          action: { type: 'string', enum: ['approve', 'reject'], description: 'Decide a waiting Harness approval. Only when the person has asked you to. They are always asked to confirm in their own session, and nothing happens if write actions are off. Production deploys get an extra confirmation. Name the run with "execution".' },
+          execution: { type: 'string', description: 'With action: the run to decide, by run number (12), planExecutionId or pipeline name. Optional when exactly one approval is waiting.' },
+          comment: { type: 'string', description: 'With action: the comment to record in the approval history' },
           diagnose: { type: 'string', description: 'Optional planExecutionId of a failed run to diagnose from its failed steps and log tail' },
           view: { type: 'string', enum: ['status', 'inventory', 'modules'], description: '"inventory": the live version of every service in every environment and infrastructure, with drift and in-flight deploys. "modules": GitOps apps, security issues, feature flags, alerts, incidents, releases, IaCM workspaces, cost anomalies, catalog, chaos and more' },
         },
       },
     })
-    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[project|start|platform|inventory|doctor|capture|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
+    await $.command.register({ name: 'harness', description: 'Harness pipelines, deployments & environments', argumentHint: '[project|approve|reject|start|platform|inventory|doctor|capture|all|mine|refresh|diagnose|layout|autofix]', immediate: true })
     if (cfg.auto_open && layout !== 'strip') await openPane($, false)
     return next(e)
   })
@@ -982,6 +1024,7 @@ export function register(on, options) {
     const raw = String(e.args || '').trim()
     const arg = raw.toLowerCase()
     if (/^projects?(\s|$)/.test(arg)) return projectCommand($, raw)
+    if (/^(approve|reject)(\s|$)/.test(arg)) return approvalCommand($, raw)
     if (arg === 'all' || arg === 'mine') scope = arg
     if (!arg) {
       view.mode = modeFor(cfg.start_view)
@@ -1057,6 +1100,11 @@ export function register(on, options) {
   on('tool.call', { tool: TOOL }, async ($, e) => {
     if (!lastAttempt || pending) await refresh($)
     if (error) return { result: 'Harness status unavailable: ' + error }
+    if (e.action === 'approve' || e.action === 'reject') {
+      const w = await findWaiting($, e.execution)
+      if (!w.found) return { result: w.text }
+      return { result: await decideApproval($, w.found.x, w.found.a, e.action === 'approve' ? 'APPROVE' : 'REJECT', { comment: e.comment ?? '' }) }
+    }
     if (e.view === 'modules') {
       mods.usedAt = await $.clock.now()
       if (!mods.at || mods.fetching) await fetchModules($)

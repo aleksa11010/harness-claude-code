@@ -715,7 +715,7 @@ test('approvals: read-only until allow_actions is on', async ($, on) => {
 })
 
 test('approve: confirm, fill the approver input, confirm production, then POST the activity', async ($, on) => {
-  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev-hotfix', 'Yes, approve for production'] })
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev-hotfix', 'Yes, approve for production', 'No comment'] })
   awaitApproval(world)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -725,6 +725,7 @@ test('approve: confirm, fill the approver input, confirm production, then POST t
     'Approve CI CD #3: "Approve deploy of 3-dev to prod"?',
     'Value for "version"?',
     'This lets CI CD #3 deploy to production (prod). Approve it?',
+    'Comment for the approve? Choose "No comment", or "Other" to type one.',
   ])
   const post = reqs(world, '/pipeline/api/approvals/ap1/harness/activity')
   expect(post.length).toBe(1)
@@ -744,18 +745,18 @@ test('approve: Cancel at any step sends nothing', async ($, on) => {
 })
 
 test('reject: one confirmation, no inputs, no production prompt', async ($, on) => {
-  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject'] })
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject', 'No comment'] })
   awaitApproval(world)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'rej-ap1' }); await clock.settle()
-  expect(world.asked.length).toBe(1)
+  expect(world.asked.length).toBe(2) // confirm, then the optional comment
   expect(JSON.parse(reqs(world, '/pipeline/api/approvals/ap1/harness/activity')[0].init.body)).toEqual({ action: 'REJECT', comments: 'From Claude Code (harness-platform)' })
   expect(world.toasts.at(-1)).toBe('✓ Rejected CI CD #3')
 })
 
 test('approve from the actions menu (a → p) uses the same flow', async ($, on) => {
-  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev', 'Yes, approve for production'] })
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev', 'Yes, approve for production', 'No comment'] })
   awaitApproval(world)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
@@ -765,7 +766,7 @@ test('approve from the actions menu (a → p) uses the same flow', async ($, on)
 })
 
 test('not an approver: Harness\'s own message is shown', async ($, on) => {
-  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject'] })
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject', 'No comment'] })
   awaitApproval(world)
   world.approvalPost = { status: 403, text: JSON.stringify({ status: 'ERROR', code: 'ACCESS_DENIED', message: 'User not authorized to approve/reject' }) }
   await start($, clock)
@@ -1008,7 +1009,7 @@ test('sign-in mode: actions go through harness_execute', async ($, on) => {
 
 test('sign-in mode: approvals list and decide through the MCP server', async ($, on) => {
   let w: any
-  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => mcpHarness(w)(t, a), answer: ['Reject'] })
+  const { world, clock } = harnessWorld(on, { env: SIGNIN, mcp: (t, a) => mcpHarness(w)(t, a), answer: ['Reject', 'No comment'] })
   w = world
   awaitApproval(world)
   await start($, clock)
@@ -1793,4 +1794,52 @@ test('inventory: x opens the newest run of the selected service in the browser',
   await ui.press({ key: 'inventory' }); await clock.settle()
   await ui.press({ key: 'inv-open' }); await new Promise((r) => setTimeout(r, 30))
   expect(world.browsed.at(-1)).toMatch(/\/pipelines\/[^/]+\/deployments\/[^/]+\/pipeline/)
+})
+
+test('a typed comment is sent with the decision', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject', 'wrong build, use #4'] })
+  awaitApproval(world)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'rej-ap1' }); await clock.settle()
+  expect(JSON.parse(reqs(world, '/pipeline/api/approvals/ap1/harness/activity')[0].init.body)).toEqual({ action: 'REJECT', comments: 'wrong build, use #4' })
+})
+
+test('/harness reject 3 <comment>: no comment prompt, the run is found by number', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Reject'] })
+  awaitApproval(world)
+  await start($, clock)
+  const out = (await $.command.run({ command: 'harness', args: 'reject 3 not this one' })) as any
+  expect(world.asked.length).toBe(1)
+  expect(JSON.parse(reqs(world, '/pipeline/api/approvals/ap1/harness/activity')[0].init.body)).toMatchObject({ action: 'REJECT', comments: 'not this one' })
+  expect(out.text).toContain('Rejected CI CD #3')
+})
+
+test('/harness approve with nothing matching lists what is waiting, and decides nothing', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve'] })
+  awaitApproval(world)
+  await start($, clock)
+  const out = (await $.command.run({ command: 'harness', args: 'approve 99' })) as any
+  expect(out.text).toContain('Nothing waiting matches "99"')
+  expect(out.text).toContain('CI CD #3')
+  expect(reqs(world, '/harness/activity').length).toBe(0)
+})
+
+test('harness_status action=approve: asks the person, reports the outcome; with actions off it does nothing', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { env: ON, answer: ['Approve', '3-dev-hotfix', 'Yes, approve for production'] })
+  awaitApproval(world)
+  await start($, clock)
+  const r = JSON.parse(JSON.stringify(await $.tool.call({ tool: TOOL, action: 'approve', comment: 'ship it' }))) as any
+  expect(r.result).toContain('Approved CI CD #3')
+  expect(JSON.parse(reqs(world, '/pipeline/api/approvals/ap1/harness/activity')[0].init.body)).toMatchObject({ action: 'APPROVE', comments: 'ship it' })
+  expect(world.asked.length).toBe(3) // the person was still asked, comment already given
+})
+
+test('harness_status action=approve with write actions off: not done, nothing sent', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { answer: ['Approve'] })
+  awaitApproval(world)
+  await start($, clock)
+  const r = (await $.tool.call({ tool: TOOL, action: 'approve' })) as any
+  expect(r.result).toMatch(/^Not done: write actions are off/)
+  expect(reqs(world, '/harness/activity').length).toBe(0)
 })

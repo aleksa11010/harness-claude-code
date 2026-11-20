@@ -525,7 +525,7 @@ The account ID is read from the key, or from Harness's links in sign-in mode. Wi
 | `/harness refresh` | refresh now |
 | `/harness doctor` | read-only checks of everything |
 | `/harness project [org/project\|-]` | open the project picker, switch to a project, or go back (`--repo` remembers it for this repo, `--forget` clears it) |
-| `/harness start <view>` | choose the starting screen: `home` · `runs` · `inventory` · `approvals` · `service` · `platform` |
+| `/harness approve\|reject [run] [comment]` | decide a waiting Harness approval (`run` = run number, execution id or pipeline; optional when only one is waiting). You are always asked to confirm, production gets an extra confirmation, and it needs `allow_actions`. Without a comment on the line you are asked for one. Claude can do the same through `harness_status` with `action`, when you ask it to; the same confirmations apply || `/harness start <view>` | choose the starting screen: `home` · `runs` · `inventory` · `approvals` · `service` · `platform` |
 | `/harness inventory` | every service × environment with its live version |
 | `/harness platform` | every Harness module, with what needs attention |
 | `/harness capture` | save an anonymized snapshot of real responses (`harness-capture.json`) |
