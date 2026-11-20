@@ -1784,3 +1784,13 @@ test('desktop: a loose ref wins over packed-refs', async ($, on) => {
   await a.clock.advance(600)
   expect(JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result).git).toEqual({ repo: 'bootcamp-app', branch: 'main', head: '1111111' })
 })
+
+test('inventory: x opens the newest run of the selected service in the browser', async ($, on) => {
+  const { world, clock } = harnessWorld(on)
+  world.cdRuns = cdHistory()
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'inventory' }); await clock.settle()
+  await ui.press({ key: 'inv-open' }); await new Promise((r) => setTimeout(r, 30))
+  expect(world.browsed.at(-1)).toMatch(/\/pipelines\/[^/]+\/deployments\/[^/]+\/pipeline/)
+})

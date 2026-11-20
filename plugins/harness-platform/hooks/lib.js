@@ -126,7 +126,7 @@ export function failureMessage(x) {
 }
 
 export function execUrl(c, x) {
-  if (x?.openInHarness) return x.openInHarness
+  if (x?.openInHarness && !/[{}]/.test(x.openInHarness)) return x.openInHarness // some Harness responses leave a {pipelineIdentifier} placeholder in it
   const u = `${c.base_url}/ng/account/${c.account_id}/all/orgs/${c.org_id}/projects/${c.project_id}` +
     `/pipelines/${encodeURIComponent(x.pipelineIdentifier)}/deployments/${encodeURIComponent(x.planExecutionId)}/pipeline`
   try { return new URL(u).href } catch { return '' }

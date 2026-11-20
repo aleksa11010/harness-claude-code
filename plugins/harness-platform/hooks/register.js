@@ -2157,11 +2157,27 @@ function renderInventory($, el, T, W, now, vertical) {
       Button({ key: 'inv-down', label: 'j ↓', hotkey: 'j', plain: true, dimColor: true, onPress: () => { moveInventory(deployed, 1); redraw() } }),
       Button({ key: 'inv-up', label: 'k ↑', hotkey: 'k', plain: true, dimColor: true, onPress: () => { moveInventory(deployed, -1); redraw() } }),
       Button({ key: 'inv-expand', label: 'e details', hotkey: 'e', plain: true, dimColor: true, onPress: () => { view.invOpen.has(view.invSel) ? view.invOpen.delete(view.invSel) : view.invOpen.add(view.invSel); redraw() } }),
+      ...(newestRunUrl(iv, deployed) ? [openRunControl(el, newestRunUrl(iv, deployed))] : []),
       Button({ key: 'inv-rescan', label: 'r rescan', hotkey: 'r', plain: true, dimColor: true, onPress: () => { scanInventory($) } }),
       Button({ key: 'inv-back', label: 'i back to runs', hotkey: 'i', plain: true, dimColor: true, onPress: () => { view.mode = 'runs'; redraw() } }),
     ],
   }))
   return out
+}
+
+// The most recent run behind the selected service, live or failed, so one key lands on the execution itself
+function newestRunUrl(iv, deployed) {
+  const r = deployed.find((x) => x.id === view.invSel)
+  if (!r) return ''
+  const runs = iv.envs.flatMap((e) => [r.cells[e.id]?.live, r.cells[e.id]?.attempt]).filter(Boolean).sort((a, b) => b.at - a.at)
+  const n = runs[0]
+  return n ? execUrl(cfg, { pipelineIdentifier: n.pipelineId, planExecutionId: n.execution, openInHarness: n.url }) : ''
+}
+
+function openRunControl(el, href) {
+  if (renderSurface !== 'terminal' || !renderOpen) return el.Link({ href, label: 'open run' })
+  const open = renderOpen
+  return el.Button({ key: 'inv-open', label: 'x open run', hotkey: 'x', plain: true, dimColor: true, onPress: () => { open(href) } })
 }
 
 function moveInventory(rows, d) {

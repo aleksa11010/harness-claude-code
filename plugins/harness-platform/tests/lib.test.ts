@@ -268,3 +268,9 @@ test('parseGitHead: loose ref, packed ref, detached HEAD, unborn branch', () => 
   expect(parseGitHead('ref: refs/heads/new', '', '')).toEqual({ branch: 'new', head: null })
   expect(parseGitHead('garbage', '', '')).toEqual({ branch: null, head: null })
 })
+
+test('execUrl ignores an openInHarness with an unfilled {placeholder}', () => {
+  const c = { base_url: 'https://app.harness.io', account_id: 'A', org_id: 'O', project_id: 'P' }
+  expect(execUrl(c, { openInHarness: 'https://x/pipelines/{pipelineIdentifier}/deployments/E/pipeline', pipelineIdentifier: 'pl', planExecutionId: 'E' }))
+    .toBe('https://app.harness.io/ng/account/A/all/orgs/O/projects/P/pipelines/pl/deployments/E/pipeline')
+})
