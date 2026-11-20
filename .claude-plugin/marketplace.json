@@ -4,9 +4,9 @@
   "owner": { "name": "Your Team" },
   "plugins": [
     {
-      "name": "harness-cicd",
-      "source": "./plugins/harness-cicd",
-      "description": "Single pane of glass for Harness: your branch's builds, pipeline runs, what's deployed where"
+      "name": "harness-platform",
+      "source": "./plugins/harness-platform",
+      "description": "Harness in Claude Code: your branch, pipelines, deployments, approvals and every platform module"
     }
   ]
 }
