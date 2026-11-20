@@ -58,6 +58,9 @@ let layout = 'stacked'
 const view = { selected: null, expanded: new Set(), collapsed: new Set(), menu: false, tab: 'runs', mode: 'runs', invSel: null, invOpen: new Set(), homeSel: 0, svcIdx: 0, modFilter: null, modFilterLabel: '', pick: { filter: '', confirm: null } }
 // Which org/project the pane watches. `scopeGen` counts switches so answers still in flight for the old project are dropped.
 let scopeGen = 0
+let renderOpen = null // opens a URL for the pane being drawn, for links the terminal can't click
+let renderSurface = ''
+let linkSeen = new Map()
 let homeScope = null // the org/project this session (or this repo) opens on
 let prevScope = null // for /harness project -
 let recents = [] // org/project pairs, newest first (persisted)
@@ -1196,6 +1199,7 @@ export function register(on, options) {
   on('ui.render', { component: 'Pane' }, async ($, e, next) => {
     if (e.requestId !== PANE) return next(e)
     const el = $.ui.resolve(e)
+    renderOpen = (url) => openUrl($, url); renderSurface = String(e.surface ?? ''); linkSeen = new Map()
     return renderPane($, el, { ...(e.props ?? {}), surface: e.surface }, await $.clock.now())
   })
 
@@ -1510,6 +1514,36 @@ async function projectCommand($, raw) {
   }
 }
 
+// Opens a Harness page in the person's browser. A terminal's OSC 8 links often can't be clicked, so there it's a button that runs the OS opener
+async function openUrl($, url) {
+  if (!/^https?:\/\//i.test(String(url ?? ''))) return
+  let platform = 'unknown'
+  try { platform = String((await $.session.info())?.platform ?? 'unknown') } catch {}
+  const openers = platform === 'windows' ? [['cmd', '/c', 'start', '', url]] : platform === 'macos' ? [['open', url]] : platform === 'linux' || platform === 'wsl' ? [['xdg-open', url]] : [['open', url], ['xdg-open', url]]
+  for (const cmd of openers) {
+    try { if ((await $.process.run(cmd, { timeoutMs: 8000 })).exitCode === 0) return } catch {}
+  }
+  $.ui.toast(`Harness: open this in your browser: ${url}`, { timeoutMs: 15000 })
+}
+
+// A link: a real hyperlink on Desktop, a pressable button on the terminal (mouse click or Enter) that opens the browser itself
+function linkTo(el, href, label) {
+  const { Button, Link } = el
+  if (!href) return null
+  if (renderSurface !== 'terminal' || !renderOpen) return Link({ href, label })
+  const n = (linkSeen.get(href) ?? 0) + 1
+  linkSeen.set(href, n)
+  const open = renderOpen
+  return Button({ key: `open:${href}${n > 1 ? '#' + n : ''}`, label, plain: true, onPress: () => { open(href) } })
+}
+
+function projectLink(el, narrow) {
+  const href = projectUrl(cfg)
+  if (renderSurface !== 'terminal' || !renderOpen) return el.Link({ href, label: narrow ? 'Harness' : 'open in Harness' })
+  const open = renderOpen
+  return el.Button({ key: 'open-project', label: narrow ? 'Browser' : 'open in Harness', hotkey: 'b', plain: true, onPress: () => { open(href) } })
+}
+
 function renderProjects($, el, T, W) {
   const { Box, Button, Input } = el
   const redraw = () => $.ui.invalidate('ui.render')
@@ -1627,7 +1661,7 @@ function renderPane($, el, props, now) {
       Button({ key: 'modules', label: view.mode === 'modules' ? (narrow ? 'Runs' : 'Back to runs') : 'Platform', hotkey: 'm', plain: true, onPress: () => { if (view.mode === 'modules') { view.mode = 'runs' } else { view.mode = 'modules'; view.modFilter = null; mods.usedAt = updatedAt; if (!mods.at) fetchModules($) } redraw() } }),
       Button({ key: 'inventory', label: view.mode === 'inventory' ? (narrow ? 'Runs' : 'Back to runs') : 'Inventory', hotkey: 'i', plain: true, onPress: () => { if (view.mode === 'inventory') { view.mode = 'runs'; redraw() } else { openInventory($) } } }),
       Button({ key: 'layout', label: narrow ? layout : `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
-      ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: narrow ? 'Harness' : 'open in Harness' })] : []),
+      ...(projectUrl(cfg) ? [projectLink(el, narrow)] : []),
     ],
   })
   const homeBtn = Button({ key: 'home', label: 'Home', hotkey: 'o', plain: true, onPress: () => { view.mode = 'home'; view.modFilter = null; redraw() } })
@@ -1638,7 +1672,7 @@ function renderPane($, el, props, now) {
       Button({ key: 'switch', label: narrow ? 'Project…' : 'Switch project', hotkey: 'g', plain: true, onPress: () => { openPicker($) } }),
       Button({ key: 'refresh', label: 'Refresh', hotkey: 'r', plain: true, onPress: () => { refresh($); mods.at = 0; fetchModules($) } }),
       Button({ key: 'layout', label: narrow ? layout : `Layout: ${layout}`, hotkey: 'v', plain: true, onPress: () => { setLayout($, LAYOUTS[(LAYOUTS.indexOf(layout) + 1) % LAYOUTS.length]) } }),
-      ...(projectUrl(cfg) ? [Link({ href: projectUrl(cfg), label: narrow ? 'Harness' : 'open in Harness' })] : []),
+      ...(projectUrl(cfg) ? [projectLink(el, narrow)] : []),
     ] })
     return Box({ flexDirection: 'column', children: [header, homeControls, ...(error ? [T(fit('⚠ ' + error, W), { color: 'red' })] : []), ...renderHome($, el, T, W, now)] })
   }
@@ -1706,7 +1740,7 @@ function renderApprovals($, el, T, W, now) {
       : [T(`decide in ${approvalWhere(a.type)}`, { dimColor: true })]
     out.push(Box({
       key: 'appr-row-' + a.id, flexDirection: 'row', columnGap: 1,
-      children: [T('◆', { color: 'magenta' }), T(fit(`${runName(x)}${to ? '  ' + to : ''}${when ? '  ' + when : ''}`, Math.max(20, W - (canAct && cfg.allow_actions ? 26 : 46)))), ...controls, Link({ href: execUrl(cfg, x), label: 'open' })],
+      children: [T('◆', { color: 'magenta' }), T(fit(`${runName(x)}${to ? '  ' + to : ''}${when ? '  ' + when : ''}`, Math.max(20, W - (canAct && cfg.allow_actions ? 26 : 46)))), ...controls, linkTo(el, execUrl(cfg, x), 'open')],
     }))
     if (a.message) for (const l of wrapLines(a.message.replace(/\s+/g, ' '), W - 6, 2)) out.push(T('    ' + l))
     const meta = [
@@ -1733,14 +1767,14 @@ function renderBranch(el, T, W, v, now) {
       h ? kindText(T, h.status, `${h.status} · #${h.runSequence} ${ago(h.startTs, now)}`)
         : !latest && isCdOnly() ? T(fit(`CD-only: deploys ${data.services.filter((x) => repoServiceIds().has(x.identifier)).map((x) => x.name).join(', ')} from manifests here`, Math.max(20, W - Math.floor(W * 0.45) - 2)), { dimColor: true })
         : T(latest ? 'HEAD not built yet' : 'no runs on this branch', { color: 'yellow' }),
-      ...(h ? [Link({ href: execUrl(cfg, h), label: 'open' })] : []),
+      ...(h ? [linkTo(el, execUrl(cfg, h), 'open')] : []),
     ],
   }))
   if (pr) out.push(renderPrRow(el, T, W))
   if (!h && latest) {
     out.push(Box({
       flexDirection: 'row', columnGap: 1,
-      children: [T('  last run'), kindText(T, latest.status, `${latest.status} on ${short(execCi(latest)?.commit)} · ${ago(latest.startTs, now)}`), Link({ href: execUrl(cfg, latest), label: 'open' })],
+      children: [T('  last run'), kindText(T, latest.status, `${latest.status} on ${short(execCi(latest)?.commit)} · ${ago(latest.startTs, now)}`), linkTo(el, execUrl(cfg, latest), 'open')],
     }))
   }
   return out
@@ -1755,7 +1789,7 @@ function renderPrRow(el, T, W) {
     children: [
       T(ICON[k], { color: COLOR[k] }),
       T(fit(prLine(pr) + (c.failing.length ? ` (${c.failing.slice(0, 3).join(', ')})` : ''), W - 10)),
-      ...(pr.url ? [Link({ href: pr.url, label: 'open' })] : []),
+      ...(pr.url ? [linkTo(el, pr.url, 'open')] : []),
     ],
   })
 }
@@ -1817,7 +1851,7 @@ function renderCard($, el, T, W, x) {
       bar(),
       Button({ key: 'ask-' + id, label: 'fix with Claude', plain: true, onPress: () => { askFix($, x) } }),
       ...(cfg.diagnose !== 'off' && !diagRuns.has(id) ? [Button({ key: 'diag-' + id, label: d ? 'diagnose again' : 'diagnose', plain: true, onPress: () => { rediagnose($, x) } })] : []),
-      Link({ href: execUrl(cfg, x), label: 'open in Harness' }),
+      linkTo(el, execUrl(cfg, x), 'open in Harness'),
       T('a more · e collapse', { dimColor: true }),
     ],
   }))
@@ -1836,7 +1870,7 @@ function renderMenu($, el, T, x) {
       children: [T('    │ ', { dimColor: true }), Button({ key: 'act-' + kind, label: `${a.key}  ${a.label}${off ? '  (off: allow_actions)' : ''}`, hotkey: a.key, plain: true, dimColor: off, onPress: () => { runAction($, kind, x) } })],
     }))
   }
-  out.push(Box({ flexDirection: 'row', children: [T('    │ ', { dimColor: true }), Link({ href: execUrl(cfg, x), label: 'Open in Harness' })] }))
+  out.push(Box({ flexDirection: 'row', children: [T('    │ ', { dimColor: true }), linkTo(el, execUrl(cfg, x), 'Open in Harness')] }))
   out.push(Box({ flexDirection: 'row', children: [T('    │ ', { dimColor: true }), Button({ key: 'act-close', label: 'q  Close menu', hotkey: 'q', plain: true, dimColor: true, onPress: () => { view.menu = false; $.ui.invalidate('ui.render') } })] }))
   return out
 }
@@ -2154,7 +2188,7 @@ function renderInventoryDetail(el, T, W, iv, r, now) {
           T(pad(where, 24)),
           l ? T(pad(l.artifact || '#' + l.run, 16), { color: 'green' }) : T(pad('nothing live', 16), { dimColor: true }),
           T(fit(l ? `${ago(l.at, now) === 'now' ? 'just now' : ago(l.at, now) + ' ago'}${l.by ? ' by ' + l.by : ''} · ${l.pipeline} #${l.run}${l.commit ? ' @' + short(l.commit) : ''}` : '', Math.max(10, W - 52)), { dimColor: true }),
-          ...(url ? [Link({ href: url, label: 'open' })] : []),
+          ...(url ? [linkTo(el, url, 'open')] : []),
         ],
       }))
       const p = pendingChanges.get(r.id + '\u0000' + e.id)
@@ -2211,7 +2245,7 @@ function renderModules($, el, T, W, now) {
       for (const x of [...r.items].sort((a, b) => rank[a.kind] - rank[b.kind]).slice(0, 8)) {
         out.push(Box({
           flexDirection: 'row', columnGap: 1,
-          children: [T('    │', { dimColor: true }), T(ICON[x.kind] ?? '·', { color: COLOR[x.kind] }), T(fit(`${x.name}${x.detail ? '  ' + x.detail : ''}`, W - (x.url ? 14 : 8))), ...(x.url ? [Link({ href: x.url, label: 'open' })] : [])],
+          children: [T('    │', { dimColor: true }), T(ICON[x.kind] ?? '·', { color: COLOR[x.kind] }), T(fit(`${x.name}${x.detail ? '  ' + x.detail : ''}`, W - (x.url ? 14 : 8))), ...(x.url ? [linkTo(el, x.url, 'open')] : [])],
         }))
       }
       if (r.items.length > 8) out.push(T(`    │ … ${r.items.length - 8} more`, { dimColor: true }))

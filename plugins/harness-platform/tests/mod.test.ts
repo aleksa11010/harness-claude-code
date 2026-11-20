@@ -46,7 +46,7 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     connector: null as null | { status: number; data?: any },
     headTime: 0, // seconds, `git log -1 --format=%ct`
     pending: null as null | ((since: number, paths: string[]) => number),
-    gitCalls: [] as string[],
+    gitCalls: [] as string[], browsed: [] as string[],
     diff: '' as string, // `git diff --unified=0 @{upstream}...HEAD`
     writes: [] as { path: string; text: string }[],
     mcpCalls: [] as any[],
@@ -88,6 +88,7 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     if (cmd === 'git rev-parse --abbrev-ref HEAD') return { value: { exitCode: 0, stdout: 'main\n', stderr: '' } }
     if (cmd === 'git rev-parse HEAD') return { value: { exitCode: 0, stdout: 'b0b0b0b0b0b0b0b0\n', stderr: '' } }
     if (cmd.startsWith('git rev-list --count') && opts.behind) return { value: { exitCode: 0, stdout: opts.behind + '\n', stderr: '' } }
+    if (/^(open|xdg-open) https?:/.test(cmd) || cmd.startsWith('cmd /c start')) { world.browsed.push(e.argv.at(-1)); return { value: { exitCode: 0, stdout: '', stderr: '' } } }
     world.gitCalls.push(cmd)
     if (cmd === 'git log -1 --format=%ct HEAD' && world.headTime) return { value: { exitCode: 0, stdout: world.headTime + '\n', stderr: '' } }
     if (cmd.startsWith('git rev-list --count --since=') && world.pending) {
@@ -986,7 +987,10 @@ test('sign-in mode: no API key, data comes through the Harness MCP server', asyn
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /^CI CD #3 / })).toBeDefined()
   // account id learned from Harness's own links
-  expect(((await ui.find({ type: 'Link', label: 'open in Harness' } as any)) as any)?.props?.href).toContain('/ng/account/ACC123/')
+  // the terminal can't always click a hyperlink, so there it's a button that opens the browser
+  expect(await ui.find({ type: 'Link', label: 'open in Harness' } as any)).toBeUndefined()
+  await ui.press({ key: 'open-project' }); await new Promise((r) => setTimeout(r, 30))
+  expect(world.browsed[0]).toContain('/ng/account/ACC123/')
 })
 
 test('sign-in mode: actions go through harness_execute', async ($, on) => {
@@ -1033,7 +1037,9 @@ test('pull request (Harness Code): checks and review on the branch row, the band
   expect(world.statuses.at(-1)).toContain('PR #7 ✗ 1 failing')
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: 'PR #7 → release: 1 check failing · review pending (ci)' })).toBeDefined()
-  expect(((await ui.find({ type: 'Link', label: 'open', href: 'https://app.harness.io/ng/account/ACC123/module/code/orgs/ORG/repos/bootcamp-app/pulls/7' } as any)) as any)).toBeDefined()
+  const prUrl = 'https://app.harness.io/ng/account/ACC123/module/code/orgs/ORG/repos/bootcamp-app/pulls/7'
+  await ui.press({ key: 'open:' + prUrl }); await new Promise((r) => setTimeout(r, 30))
+  expect(world.browsed).toContain(prUrl)
   const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
   expect(s.pull_request).toMatchObject({ number: 7, target: 'release', review: 'review pending', checks: ['ci: failure', 'lint: success'] })
 })
