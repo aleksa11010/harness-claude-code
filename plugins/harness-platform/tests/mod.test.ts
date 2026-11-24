@@ -52,6 +52,8 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     mcpCalls: [] as any[],
     projectList: [] as any[], // GET /ng/api/projects, across orgs
     byProject: {} as Record<string, any[]>, // runs per projectIdentifier; others get `executions`
+    graph: null as any, // GET /pipeline/api/pipelines/execution/v2/{id}
+    logText: '' as string, // the log service blob for a failed step
   }
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, opts.env ?? ENV)
@@ -117,6 +119,9 @@ function harnessWorld(on: any, opts: { env?: Record<string, string>; httpStatus?
     if (e.url.includes('/pipeline/api/v1/') && e.url.includes('/approvals/execution/')) return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(world.approvalList) } }
     if (e.url.includes('/inputsetV2')) return ok({ inputSetYaml: world.inputs })
     if (e.url.includes('/pipeline/api/inputSets/template')) return ok({ inputSetTemplateYaml: world.template })
+    if (e.url.includes('/pipeline/api/pipelines/execution/v2/') && world.graph) return ok(world.graph)
+    if (e.url.includes('/log-service/token') && world.logText) return { value: { status: 200, ok: true, headers: {}, text: 'tok' } }
+    if (e.url.includes('/log-service/blob') && world.logText) return { value: { status: 200, ok: true, headers: {}, text: world.logText } }
     if (e.url.includes('/ng/api/freeze/getGlobalFreeze')) return ok(world.globalFreeze)
     if (e.url.includes('/ng/api/freeze/list')) return ok({ content: world.freezeList })
     const bare = (d: unknown) => ({ value: { status: 200, ok: true, headers: {}, text: JSON.stringify(d) } })
@@ -501,8 +506,8 @@ test('production guardrail with nobody to ask: denied', async ($, on) => {
   expect(out.deny).toMatch(/needs the user to confirm it, but nobody could be asked/)
 })
 
-test('automatic context: CI/deploy prompts get one line of Harness state; others none', async ($, on) => {
-  const { world, clock } = harnessWorld(on, { behind: '3' })
+test('automatic context (context_level line): CI/deploy prompts get one line of Harness state; others none', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { behind: '3', env: { ...ENV, HARNESS_PLATFORM_CONTEXT: 'line' } })
   world.executions.push({ ...structuredClone(executions[0]), planExecutionId: 'prodok', status: 'Success',
     moduleInfo: { ...executions[0].moduleInfo, ci: { ...executions[0].moduleInfo.ci, ciPipelineStageModuleInfo: { ...executions[0].moduleInfo.ci.ciPipelineStageModuleInfo, commitId: 'c0ffee' } } },
     layoutNodeMap: { b: { ...executions[0].layoutNodeMap.b, status: 'Success' } } })
@@ -518,6 +523,52 @@ test('automatic context: CI/deploy prompts get one line of Harness state; others
   expect(await ui.find({ type: 'Text', text: 'prod 3 behind' })).toBeDefined()
   const s = JSON.parse(((await $.tool.call({ tool: TOOL })) as any).result)
   expect(s.prod_commits_behind_head).toBe(3)
+})
+
+test('rich context (default): a block for Harness questions, a short line when nothing changed, an update line when something did', async ($, on) => {
+  const { world, clock } = harnessWorld(on, { behind: '3' })
+  world.executions.push({ ...structuredClone(executions[0]), planExecutionId: 'prodok', status: 'Success',
+    moduleInfo: { ...executions[0].moduleInfo, ci: { ...executions[0].moduleInfo.ci, ciPipelineStageModuleInfo: { ...executions[0].moduleInfo.ci.ciPipelineStageModuleInfo, commitId: 'c0ffee' } } },
+    layoutNodeMap: { b: { ...executions[0].layoutNodeMap.b, status: 'Success' } } })
+  await start($, clock)
+  await $.prompt.submit({ text: 'can I deploy this to prod?' })
+  const block = world.contexts[0][0]
+  expect(block).toStartWith('<harness_context source="harness-platform" project="ORG/proj"')
+  expect(block).toContain('## Your change\nbootcamp-app @ main, HEAD b0b0b0b')
+  expect(block).toContain('## Deployments\nbootcamp-app:')
+  expect(block).toContain('3 commits behind HEAD')
+  expect(block).toContain('## Guardrails in force')
+  expect(block).toEndWith('</harness_context>')
+  // Same question, same state: one line instead of the block again
+  await $.prompt.submit({ text: 'should I deploy to prod now?' })
+  expect(world.contexts[1]).toEqual([expect.stringMatching(/^\[Harness, from the harness-platform plugin\] No change since the Harness context sent with an earlier message \(HEAD b0b0b0b Running/)])
+  // Not about Harness, nothing changed: nothing added
+  await $.prompt.submit({ text: 'rename this variable' })
+  expect(world.contexts[2]).toEqual([])
+  // The running deploy finishes; the next unrelated prompt hears about it in one line
+  world.executions[0] = { ...world.executions[0], status: 'Failed' }
+  await clock.advance(70_000) // the next 60 s poll
+  await $.prompt.submit({ text: 'rename this other variable' })
+  expect(world.contexts[3]).toEqual(['[Harness update, from the harness-platform plugin] CI CD #3 finished: Failed.'])
+  // …and Claude can always ask for the whole block
+  const full = ((await $.tool.call({ tool: TOOL, view: 'context' })) as any).result
+  expect(full).toContain('## Your change')
+  expect(full).toContain('## Deployments')
+})
+
+test('rich context: the failing test from the step log reaches the diagnosis and the block', async ($, on) => {
+  const log = ['[ERROR] Failures: ', '[ERROR]   TaskManagerTest$StatsTests.completionRateIsRoundedPercentage:255 expected: <33> but was: <0>', ...Array.from({ length: 70 }, (_, i) => `[INFO] filler ${i}`), '[INFO] BUILD FAILURE']
+  const { world, clock } = harnessWorld(on)
+  world.executions[0] = { ...world.executions[0], status: 'Failed', layoutNodeMap: { a: { ...world.executions[0].layoutNodeMap.a, status: 'Failed', failureInfo: { message: 'exit status 1' } } } }
+  world.graph = { executionGraph: { nodeMap: { s1: { name: 'Unit tests', identifier: 'Unit_tests', stepType: 'Run', status: 'Failed', failureInfo: { message: 'exit status 1' }, logBaseKey: 'k1' } } } }
+  world.logText = log.map((out) => JSON.stringify({ out })).join('\n')
+  await start($, clock)
+  await $.tool.call({ tool: TOOL, diagnose: 'run5' })
+  const prompt = world.modelCalls.at(-1).prompt
+  expect(prompt).toContain("Key lines found in the failed step's log")
+  expect(prompt).toContain('completionRateIsRoundedPercentage:255 expected: <33> but was: <0>')
+  await $.prompt.submit({ text: 'why did the build fail?' })
+  expect(world.contexts.at(-1)![0]).toContain('failing test: TaskManagerTest$StatsTests.completionRateIsRoundedPercentage:255 — expected: <33> but was: <0>')
 })
 
 // ---------------------------------------------------------------- round 2: your design picks

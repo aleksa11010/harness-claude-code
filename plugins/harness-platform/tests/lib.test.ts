@@ -274,3 +274,117 @@ test('execUrl ignores an openInHarness with an unfilled {placeholder}', () => {
   expect(execUrl(c, { openInHarness: 'https://x/pipelines/{pipelineIdentifier}/deployments/E/pipeline', pipelineIdentifier: 'pl', planExecutionId: 'E' }))
     .toBe('https://app.harness.io/ng/account/A/all/orgs/O/projects/P/pipelines/pl/deployments/E/pipeline')
 })
+
+// ---------------------------------------------------------------- rich context
+
+import { classifyPrompt, failureSignals, failingTests, contextBlock, contextSnapshot, contextDelta, sameSnapshot, contextUnchanged, buildInventory } from '../hooks/lib.js'
+
+// A Maven run that failed one JUnit test, as the log service sends it (NDJSON): the assertion is far above the tail
+const MAVEN_LOG = [
+  '[INFO] Scanning for projects...',
+  '[INFO] Running com.sample.taskmanager.TaskManagerTest$StatsTests',
+  '[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.02 s <<< FAILURE! -- in com.sample.taskmanager.TaskManagerTest$StatsTests',
+  '[ERROR] com.sample.taskmanager.TaskManagerTest$StatsTests.completionRateIsRoundedPercentage -- Time elapsed: 0.004 s <<< FAILURE!',
+  'org.opentest4j.AssertionFailedError: expected: <33> but was: <0>',
+  '\tat com.sample.taskmanager.TaskManagerTest$StatsTests.completionRateIsRoundedPercentage(TaskManagerTest.java:255)',
+  '[ERROR] Failures: ',
+  '[ERROR]   TaskManagerTest$StatsTests.completionRateIsRoundedPercentage:255 expected: <33> but was: <0>',
+  '[ERROR] Tests run: 32, Failures: 1, Errors: 0, Skipped: 0',
+  ...Array.from({ length: 40 }, (_, i) => `[INFO] filler ${i}`),
+  '[INFO] BUILD FAILURE',
+  '[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project taskmanager: There are test failures.',
+  '[ERROR] Re-run Maven using the -X switch to enable full debug logging.',
+  '[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/MojoFailureException',
+].map((out) => JSON.stringify({ out, level: 'INFO' })).join('\n')
+
+test('rich context: prompts are sorted into topics; unrelated ones get none', () => {
+  expect([...classifyPrompt('why is the build red?')]).toEqual(expect.arrayContaining(['build']))
+  expect([...classifyPrompt('is it safe to deploy to prod?')]).toEqual(expect.arrayContaining(['deploy']))
+  expect([...classifyPrompt('any critical CVEs in our dependencies?')]).toEqual(expect.arrayContaining(['security']))
+  expect([...classifyPrompt('can the PR merge? who has to approve the release?')]).toEqual(expect.arrayContaining(['pr', 'approval', 'deploy']))
+  expect(classifyPrompt('rename this variable').size).toBe(0)
+})
+
+test('rich context: the failing test and its assertion are found above the log tail', () => {
+  const sig = failureSignals(MAVEN_LOG)
+  expect(sig).toContain('org.opentest4j.AssertionFailedError: expected: <33> but was: <0>')
+  expect(sig.some((s) => /Re-run Maven|Help 1|^\s*at /.test(s))).toBe(false) // boilerplate and stack frames are dropped
+  expect(failingTests(sig)).toEqual([{ test: 'TaskManagerTest$StatsTests.completionRateIsRoundedPercentage', line: 255, message: 'expected: <33> but was: <0>' }])
+  expect(failingTests(failureSignals('FAILED tests/test_inv.py::test_total - AssertionError: assert 5 == 3'))).toEqual([{ test: 'tests/test_inv.py::test_total', message: 'AssertionError: assert 5 == 3' }])
+})
+
+// HEAD f52557b failed its unit tests; the commit before it built, deployed to dev and waits for prod approval
+const failedHead = {
+  ...structuredClone(executions[0]), planExecutionId: 'run9', runSequence: 9, status: 'Failed', startTs: T0 - 20 * 60_000,
+  moduleInfo: { ci: { ...structuredClone(executions[0].moduleInfo.ci), ciPipelineStageModuleInfo: { ...executions[0].moduleInfo.ci.ciPipelineStageModuleInfo, commitId: 'f52557b459c40fd9', commitMessage: 'Simplify completion rate calculation\n' } } },
+  layoutNodeMap: { a: { nodeType: 'CI', nodeGroup: 'STAGE', nodeIdentifier: 'Build', name: 'Build', status: 'Failed', module: 'ci', moduleInfo: { ci: {} }, startTs: T0 - 20 * 60_000, failureInfo: { message: '1 error occurred: exit status 1' } } },
+}
+const richData = (extraRuns: any[] = [failedHead]) => ({ ...data({ name: 'bootcamp-app', branch: 'main', head: 'f52557b459c40fd9' }), executions: [...extraRuns, ...executions] })
+const approvalOn = (x: any) => ({ x, a: { id: 'ap1', type: 'HarnessApproval', deadline: T0 + 23 * 3600_000, created: T0, message: 'Approve deploy of 3-dev to prod?', approvers: ['_project_all_users'], minimumCount: 1, inputs: [{ name: 'change_ticket', default: '' }] } })
+
+test('rich context: a build question gets your change with the failing test, the diagnosis and the push guard', () => {
+  const v = buildView(richData(), 'mine')
+  const diagnoses = new Map([['run9', { state: 'done', cause: 'getCompletionRate uses integer division', fix: 'multiply before dividing', confidence: 'high', fromLogs: true, tests: failingTests(failureSignals(MAVEN_LOG)) }]])
+  const block = contextBlock(v, { cfg: { ...cfg, push_guard: 'hold', prod_guard: true }, now: T0, topics: classifyPrompt('why is my build failing?'), diagnoses, url: () => 'https://h/run9' })
+  expect(block).toStartWith('<harness_context source="harness-platform" project="ORG/proj"')
+  expect(block).toContain('## Your change')
+  expect(block).toContain('f52557b (HEAD) "Simplify completion rate calculation" → CI CD #9 Failed 20m ago')
+  expect(block).toContain('failing test: TaskManagerTest$StatsTests.completionRateIsRoundedPercentage:255 — expected: <33> but was: <0>')
+  expect(block).toContain('diagnosis: getCompletionRate uses integer division; likely fix: multiply before dividing (high confidence)')
+  expect(block).toContain('Push guard: a git push now waits for the user to confirm')
+  expect(block).not.toContain('## Deployments') // not asked about
+  expect(block).toEndWith('</harness_context>')
+})
+
+test('rich context: a deploy question gets every environment, drift, approvals waiting, freeze schedule and policies', () => {
+  const v = buildView(richData([]), 'mine')
+  const inventory = buildInventory(executions, services.map((s) => s.service), environments.map((e) => e.environment))
+  const block = contextBlock(v, {
+    cfg: { ...cfg, prod_guard: true, allow_actions: false }, now: T0, topics: classifyPrompt('can I promote to prod?'), behind: 3, inventory,
+    approvals: [approvalOn(executions[0])], pending: new Map([['bootcampapp\u0000prod', 1]]),
+    freeze: { active: [], frozen: false, upcoming: [{ name: 'Year-end freeze', upcoming: T0 + 5 * 86400_000, until: T0 + 9 * 86400_000 }] },
+    policySets: [{ name: 'Prod guardrails', action: 'onrun', severity: 'warning' }],
+  })
+  expect(block).toContain('## Deployments')
+  expect(block).toMatch(/prod ★: .*1 manifest change not deployed · 3 commits behind HEAD/)
+  expect(block).toContain('## Waiting on people')
+  expect(block).toMatch(/- CI CD #3: "Approve deploy of 3-dev to prod\?" · expires in 23h · approvers _project_all_users · asks for change_ticket/)
+  expect(block).toContain('write actions are off in the plugin')
+  expect(block).toContain('## Guardrails in force')
+  expect(block).toContain('No freeze active · next: "Year-end freeze" from 2026-10-10 12:00 UTC to 2026-10-14 12:00 UTC')
+  expect(block).toContain('OPA policy set "Prod guardrails" (on run), warning')
+})
+
+test('rich context: security shows on security questions, and on others only when something is critical', () => {
+  const v = buildView(richData(), 'mine')
+  const security = { source: 'latest scan on main: CI CD #8', critical: 15, high: 61, top: [{ name: 'CVE-2021-44228: Remote code injection in Log4j', sev: 'Critical' }] }
+  expect(contextBlock(v, { cfg, now: T0, topics: classifyPrompt('any vulnerabilities?'), security })).toContain('## Security (latest scan on main: CI CD #8)\n15 critical, 61 high\n- Critical: CVE-2021-44228')
+  expect(contextBlock(v, { cfg, now: T0, topics: classifyPrompt('fix the build'), security })).toContain('15 critical, 61 high')
+  expect(contextBlock(v, { cfg, now: T0, topics: classifyPrompt('fix the build'), security: { ...security, critical: 0 } })).not.toContain('## Security')
+})
+
+test('rich context: the budget drops the least useful sections first, never what changed', () => {
+  const v = buildView(richData(), 'mine')
+  const inventory = buildInventory(executions, services.map((s) => s.service), environments.map((e) => e.environment))
+  const x = { cfg, now: T0, topics: classifyPrompt('status of build, deploys, security and approvals?'), inventory, approvals: [approvalOn(executions[0])], delta: ['CI CD #9 finished: Failed'],
+    security: { critical: 2, high: 1, top: [{ name: 'CVE-1', sev: 'Critical' }] }, freeze: { active: [], upcoming: [], frozen: false } }
+  const full = contextBlock(v, { ...x, budget: 4000 })
+  const small = contextBlock(v, { ...x, budget: 150 })
+  expect(full).toContain('## Security')
+  expect(full.length).toBeGreaterThan(600)
+  expect(small.length).toBeLessThanOrEqual(600)
+  expect(small).toContain('## Since your last message\n- CI CD #9 finished: Failed')
+  expect(small).not.toContain('## Security')
+})
+
+test('rich context: what changed between prompts, and nothing when nothing did', () => {
+  const v1 = buildView(richData([]), 'mine')
+  const s1 = contextSnapshot(v1, { approvals: [] })
+  const v2 = buildView(richData(), 'mine')
+  const s2 = contextSnapshot(v2, { approvals: [approvalOn(executions[0])], freeze: { frozen: true } })
+  expect(contextDelta(s1, s2)).toEqual(['CI CD #9 started (now Failed)', '1 new approval waiting', 'a deployment freeze started'])
+  expect(contextDelta(s2, s2)).toEqual([])
+  expect(contextDelta(null, s2)).toEqual([])
+  expect(sameSnapshot(s2, structuredClone(s2))).toBe(true)
+  expect(contextUnchanged(v2, { approvals: [approvalOn(executions[0])] })).toBe('[Harness, from the harness-platform plugin] No change since the Harness context sent with an earlier message (HEAD f52557b Failed, 1 approval waiting).')
+})

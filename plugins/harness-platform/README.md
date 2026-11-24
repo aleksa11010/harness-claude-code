@@ -57,7 +57,7 @@ New in 0.4:
 - **Push guard** (`push_guard`): when Claude is about to `git push` onto a red branch — `hold` asks first (default), `warn` toasts, `off`.
 - **Production guardrail** (`prod_guard`): any Harness MCP write action (execute/create/update/delete) that targets a production environment asks you first, in every permission mode; with nobody to ask it is denied.
 - **Commits behind prod:** how far the last successful prod deploy is behind your HEAD (pane, tool, context).
-- **Automatic context** (`add_context`): prompts about builds/deploys/releases get one line of current Harness state.
+- **Automatic context** (`context_level`, default `rich`): prompts get the Harness state they're about — your change with failing tests and diagnosis, deployments per environment and infrastructure, approvals waiting, guardrails (freezes, policy sets), and your branch's security scan — within `context_budget` tokens, and only re-sent when something changed. `line` keeps the original one line; `harness_status` with `view: "context"` returns the full block.
 
 The pane itself is still read-only: it never runs, approves, or rolls back anything. Per-shell overrides: `HARNESS_CICD_ON_FAILURE`, `HARNESS_CICD_PUSH_GUARD`, `HARNESS_CICD_DIAGNOSE`.
 
@@ -100,7 +100,9 @@ Instead of env vars you can set the values in `/config` (the API key is stored i
 | push_guard | hold | hold · warn · off |
 | prod_guard | true | confirm Harness write actions that target production |
 | diagnose | auto | auto · on_demand · off (uses a small model on your plan) |
-| add_context | true | one line of Harness state on CI/deploy prompts |
+| add_context | true | add Harness state to prompts at all |
+| context_level | rich | rich · line · off |
+| context_budget | 1200 | tokens the rich context may add to one prompt (300–4000) |
 | layout | stacked | stacked · focus · dock · strip (press v to switch) |
 | band | true | band above the prompt with sparkline |
 | allow_actions | false | retry / rerun / abort / approve / reject from the actions menu |

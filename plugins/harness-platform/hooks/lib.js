@@ -370,7 +370,7 @@ export const DIAGNOSIS_SYSTEM =
   '"fix": "<the most likely fix in one sentence, max 160 chars>", "confidence": "high|medium|low"}. ' +
   'Be specific (name the step, resource, limit or test). If the information is insufficient, say so in cause and set confidence to low.'
 
-export function diagnosisPrompt(x, steps, tail, git) {
+export function diagnosisPrompt(x, steps, tail, git, signals = []) {
   const ci = execCi(x)
   const lines = [
     `Pipeline: ${x.name ?? x.pipelineIdentifier} #${x.runSequence ?? ''} — status ${x.status}`,
@@ -379,6 +379,7 @@ export function diagnosisPrompt(x, steps, tail, git) {
     git?.head && ci?.commit === git.head ? 'This is the developer\'s current HEAD commit.' : '',
     'Failures:',
     ...steps.map((s) => `- ${s.level} "${s.name}"${s.stepType ? ` (${s.stepType})` : ''}: ${s.status}${s.message ? ` — ${s.message}` : ''}${s.codes?.length ? ` [${s.codes.join(', ')}]` : ''}`),
+    signals.length ? `\nKey lines found in the failed step's log (assertions, errors):\n${signals.join('\n')}` : '',
     tail ? `\nLast log lines of the failed step:\n${tail}` : '\nNo step log was available.',
   ]
   return lines.filter(Boolean).join('\n')
@@ -457,6 +458,259 @@ export function contextLine(v, extra = {}) {
   if (extra.freeze) parts.push(`deployment freeze active: ${extra.freeze.replace(/^❄ /, '')}`)
   if (!parts.length) return ''
   return `[Harness, from the harness-platform plugin] ${parts.join('; ')}. Call the harness_status tool for details.`
+}
+
+// ---- Rich context (context_level: rich) ----------------------------------------------
+// A structured block instead of one line: sections picked by what the prompt is about,
+// cut to a token budget, and only re-sent in full when Harness state has changed.
+
+const TOPIC_RE = {
+  build: /\b(build\w*|tests?|testing|ci|ci\/cd|fail\w*|red|broken|fix\w*|errors?|pipelines?|push\w*|commit\w*|green|compil\w*)\b/i,
+  deploy: /\b(deploy\w*|release\w*|rollback|roll back|promot\w*|prod|production|staging|qa|environments?|live|versions?|ship\w*|cd|inventory)\b/i,
+  security: /\b(secur\w*|cves?|vuln\w*|dependenc\w*|log4j|sca|sast|secrets?|scan\w*|sto)\b/i,
+  pr: /\b(pr|prs|pull requests?|merg\w*|review\w*|checks?)\b/i,
+  approval: /\b(approv\w*|freez\w*|gates?|sign[- ]off|change ticket)\b/i,
+  status: /\b(harness|status|what'?s (going on|happening|broken)|where are we|ready)\b/i,
+}
+
+// The topics a prompt touches; empty when it isn't about Harness at all
+export function classifyPrompt(text) {
+  const t = String(text ?? '')
+  return new Set(Object.keys(TOPIC_RE).filter((k) => TOPIC_RE[k].test(t)))
+}
+
+// Every line of a step log (NDJSON from the log service, or plain text)
+export function logLines(text) {
+  const out = []
+  for (const raw of String(text ?? '').split('\n')) {
+    if (!raw.trim()) continue
+    try { const j = JSON.parse(raw); out.push(String(j.out ?? j.message ?? '').replace(/\s+$/, '')) } catch { out.push(raw) }
+  }
+  return out.flatMap((l) => l.split('\n')).filter((l) => l.trim())
+}
+
+// Lines that say why a step failed: assertions, test summaries, compiler and runtime errors.
+// They are usually far above the tail (Maven ends with ~20 lines of boilerplate), so they are searched for.
+const SIGNAL_RE = /(expected:?\s*<.*>\s*but was|AssertionError|AssertionFailedError|Tests run:.*(Failures|Errors): [1-9]|^\[ERROR\]\s+(Failures|Errors|Tests run):|^\[ERROR\]\s+[A-Za-z_][\w$]*(\.[\w$]+)+:\d+|^FAILED\s|^FAIL\s|^E\s{2,}\S|Traceback \(most recent call last\)|\b\w+(Error|Exception):\s|cannot find symbol|COMPILATION ERROR|Could not (resolve|find artifact)|npm ERR!|\berror(\[E\d+\])?:\s|OOMKilled|panic:)/i
+const NOISE_RE = /(Re-run Maven|\[Help \d\]|To see the full stack trace|For more information about the errors|Please refer to|cwiki\.apache\.org|dump files|^\[ERROR\]\s*$|^\s*at\s+[\w$.]+\()/i
+const stripStamp = (s) => s.replace(/^\s*\[?\d{4}-\d\d-\d\dT[\d:.]+Z\]?\s*(info|error|warn|warning|debug)?:?\s*/i, '').trim()
+
+export function failureSignals(text, max = 12) {
+  const seen = new Set()
+  const out = []
+  for (const l of logLines(text)) {
+    const s = stripStamp(l)
+    if (!s || NOISE_RE.test(s) || !SIGNAL_RE.test(s) || seen.has(s)) continue
+    seen.add(s)
+    out.push(fit(s, 220))
+    if (out.length >= max) break
+  }
+  return out
+}
+
+// Failing tests named in those lines: Surefire/Gradle "Class$Nested.method:LINE message", pytest "FAILED path::test - msg"
+export function failingTests(signals) {
+  const out = []
+  const seen = new Set()
+  for (const s of signals ?? []) {
+    let m = /^(?:\[ERROR\]\s+)?([A-Za-z_][\w$]*(?:[.$#][\w$]+)+):(\d+)\s+(.+)$/.exec(s)
+    if (m && !/^(org|com|java|javax|jdk|sun|kotlin)\./.test(m[1]) && !seen.has(m[1])) {
+      seen.add(m[1]); out.push({ test: m[1], line: Number(m[2]), message: fit(m[3].replace(/^.*?==>\s*/, ''), 160) }); continue
+    }
+    m = /^FAILED\s+(\S+::\S+)(?:\s+-\s+(.*))?$/.exec(s)
+    if (m && !seen.has(m[1])) { seen.add(m[1]); out.push({ test: m[1], message: fit(m[2] ?? '', 160) }) }
+  }
+  return out.slice(0, 5)
+}
+
+const runLabel = (x) => `${x.name ?? x.pipelineIdentifier} #${x.runSequence ?? ''}`
+const envList = (x) => [...new Set(cdTargets(x).map((t) => t.envName || t.env))]
+const stamp = (ms) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC'
+
+// Harness state for Claude, as a block with sections. `x` carries what the mod already holds:
+// cfg, now, topics, budget (tokens), behind, diagnoses, pr, freeze, approvals [{x, a}], inventory, pending (Map svc\0env → n),
+// policySets [{name, action, severity}], security { source, critical, high, top: [{name, sev}] }, delta [lines], scopeNote
+export function contextBlock(v, x = {}) {
+  const now = x.now ?? 0
+  const topics = x.topics ?? new Set()
+  const want = (...t) => t.some((k) => topics.has(k))
+  const c = x.cfg ?? {}
+  const b = v.branch
+  const headRun = b?.headRun ?? null
+  const headRed = Boolean(headRun) && statusKind(headRun.status) === 'fail'
+  const sections = []
+  const add = (key, prio, title, lines) => {
+    const l = lines.filter(Boolean)
+    if (l.length) sections.push({ key, prio: prio + (topics.has(key) ? 30 : 0), title, lines: l })
+  }
+
+  // Your change: HEAD, the runs on this branch, the failure in detail, the PR, what a push will do
+  if (b && (want('build', 'pr', 'status', 'deploy', 'security') || headRed)) {
+    const L = []
+    const key = v.git?.name || ''
+    const onBranch = (v.executions ?? []).filter((r) => (!key || execRepoKeys(r).has(key)) && (execCi(r)?.branches ?? []).includes(b.name))
+    L.push(`${v.git?.name ?? 'repo'} @ ${b.name}, HEAD ${short(b.head)}${headRun ? '' : b.head ? ' (not built in Harness yet)' : ''}`)
+    const seenCommits = new Set()
+    for (const r of onBranch) {
+      const ci = execCi(r)
+      if (!ci?.commit || seenCommits.has(ci.commit) || seenCommits.size >= 3) continue
+      seenCommits.add(ci.commit)
+      const isHead = ci.commit === b.head
+      const deployed = cdTargets(r).filter((t) => statusKind(t.status) === 'ok').map((t) => t.envName || t.env)
+      const kind = statusKind(r.status)
+      L.push(`- ${short(ci.commit)}${isHead ? ' (HEAD)' : ''} "${fit(ci.message, 70)}" → ${runLabel(r)} ${r.status}${ago(r.startTs, now) ? ` ${ago(r.startTs, now)} ago` : ''}` +
+        (deployed.length ? `, deployed to ${[...new Set(deployed)].join(' + ')}` : '') + (kind === 'wait' ? ', waiting for approval' : ''))
+      if (kind !== 'fail') continue
+      const d = x.diagnoses?.get?.(r.planExecutionId)
+      const msg = failureMessage(r)
+      if (msg) L.push(`  failed at: ${fit(msg, 160)}`)
+      for (const t of (d?.tests ?? []).slice(0, 3)) L.push(`  failing test: ${t.test}${t.line ? ':' + t.line : ''}${t.message ? ` — ${t.message}` : ''}`)
+      if (!d?.tests?.length) for (const s of (d?.signals ?? []).slice(0, 3)) L.push(`  log: ${s}`)
+      if (d?.state === 'done' && d.cause) L.push(`  diagnosis: ${d.cause}${d.fix ? `; likely fix: ${d.fix}` : ''} (${d.confidence} confidence${d.fromLogs ? '' : ', no step log'})`)
+      if (isHead && x.url) L.push(`  run: ${x.url(r)}`)
+    }
+    if (x.pr) {
+      const s = summarizeChecks(x.pr.checks)
+      L.push(`- ${prLine(x.pr)}${s.failing.length ? ` (${s.failing.slice(0, 3).join(', ')})` : ''}`)
+    }
+    if (headRed && c.push_guard === 'hold') L.push('- Push guard: a git push now waits for the user to confirm, because this branch is red in Harness')
+    else if (headRed && c.push_guard === 'warn') L.push('- Push guard: pushing now shows the user a warning (branch is red)')
+    add('build', 70, 'Your change', L)
+  }
+
+  // Deployments: live version per environment and infrastructure, newer attempts, drift, prod lag, undeployed manifest changes
+  if (want('deploy', 'status', 'approval')) {
+    const L = []
+    const inv = x.inventory
+    const rows = inv?.rows?.filter((r) => r.deployed) ?? []
+    if (rows.length) {
+      for (const r of rows.slice(0, 3)) {
+        L.push(`${r.name}:`)
+        for (const e of inv.envs) {
+          const cell = r.cells[e.id]
+          if (!cell) continue
+          const prod = e.type === 'Production'
+          let s
+          if (!cell.live) s = cell.attempt ? `nothing live · last attempt ${cell.attempt.artifact || '#' + cell.attempt.run} ${cell.attempt.status}` : '—'
+          else if (cell.mixed) s = cell.infras.filter((i) => i.live).map((i) => `${i.infra || 'default'}: ${i.live.artifact || '#' + i.live.run} (${i.live.pipeline} #${i.live.run})`).join(' · ') + ` ⚠ ${cell.versions.length} versions`
+          else s = `${cell.live.artifact || '#' + cell.live.run} (${cell.live.pipeline} #${cell.live.run}${cell.live.commit ? ', ' + short(cell.live.commit) : ''}) ${ago(cell.live.at, now)} ago`
+          if (cell.live && cell.attempt) s += statusKind(cell.attempt.status) === 'run'
+            ? ` · newer ${cell.attempt.artifact || '#' + cell.attempt.run} deploying now (${cell.attempt.pipeline} #${cell.attempt.run})`
+            : ` · newer attempt ${cell.attempt.artifact || '#' + cell.attempt.run} ${cell.attempt.status.toLowerCase()} (${cell.attempt.pipeline} #${cell.attempt.run}); the version above stayed live`
+          const pend = x.pending?.get?.(r.id + '\u0000' + e.id)
+          if (pend) s += ` · ${pend} manifest change${pend === 1 ? '' : 's'} not deployed`
+          if (prod && typeof x.behind === 'number') s += ` · ${x.behind} commit${x.behind === 1 ? '' : 's'} behind HEAD`
+          L.push(`  ${e.name}${prod ? ' ★' : ''}: ${s}`)
+        }
+        for (const d of r.drift) L.push(`  drift: ${d.to} runs a different version from ${d.from}`)
+      }
+    } else {
+      for (const s of v.matrix.services.slice(0, 3)) {
+        const cells = v.matrix.envs.map((e) => s.cells[e.id] ? `${e.name} ${s.cells[e.id].artifact || ''} ${s.cells[e.id].status}`.replace(/\s+/g, ' ') : null).filter(Boolean)
+        if (cells.length) L.push(`${s.name}: ${cells.join(', ')}`)
+      }
+      if (typeof x.behind === 'number') L.push(`prod is ${x.behind} commit${x.behind === 1 ? '' : 's'} behind HEAD`)
+    }
+    add('deploy', 50, 'Deployments', L)
+  }
+
+  // Waiting on people: always worth knowing
+  const waiting = (x.approvals ?? []).map(({ x: r, a }) => {
+    const where = a.type && a.type !== 'HarnessApproval' ? ` (decided in ${approvalWhere(a.type)})` : ''
+    // The message names the target; without one, say where the run has deployed so far
+    const so = !a.message && envList(r).length ? ` (deployed to ${envList(r).join(', ')} so far)` : ''
+    return `- ${runLabel(r)}: ${a.message ? `"${fit(a.message, 90)}"` : 'approval'}${so}${where}` +
+      [expiresIn(a.deadline, now), a.approvers.length ? `approvers ${a.approvers.join(', ')}${a.minimumCount > 1 ? ` (${a.minimumCount} needed)` : ''}` : '', a.inputs.length ? `asks for ${a.inputs.map((i) => i.name).join(', ')}` : ''].filter(Boolean).map((p) => ` · ${p}`).join('')
+  })
+  if (waiting.length) waiting.push(c.allow_actions ? '  (Claude can decide one with harness_status action=approve|reject; the user confirms)' : '  (write actions are off in the plugin: the user approves in Harness)')
+  add('approval', 65, 'Waiting on people', waiting)
+
+  // Guardrails in force
+  if (want('deploy', 'approval', 'status') || (want('build') && headRed)) {
+    const L = []
+    if (c.prod_guard !== false) L.push('- Production actions through the Harness MCP server need the user\'s confirmation')
+    if (x.freeze?.frozen) L.push(`- Deployment freeze ACTIVE: ${freezeText(x.freeze, now).replace(/^❄ /, '')}. Production deploys are blocked; don't attempt them`)
+    else if (x.freeze?.upcoming?.length) L.push(`- No freeze active · next: "${x.freeze.upcoming[0].name}" from ${stamp(x.freeze.upcoming[0].upcoming)}${x.freeze.upcoming[0].until ? ` to ${stamp(x.freeze.upcoming[0].until)}` : ''}`)
+    else if (x.freeze) L.push('- No freeze active or scheduled')
+    for (const p of (x.policySets ?? []).slice(0, 4)) L.push(`- OPA policy set "${p.name}"${p.action ? ` (on ${p.action.replace(/^on/, '')})` : ''}${p.severity ? `, ${p.severity}` : ''}`)
+    if (c.allow_actions === false) L.push('- Plugin write actions (retry, rerun, abort, approve) are off')
+    add('guardrails', 40, 'Guardrails in force', L)
+  }
+
+  // Security: the latest scan of this branch (or the project baseline)
+  const sec = x.security
+  if (sec && (sec.critical || sec.high) && (want('security') || (sec.critical && want('build', 'pr', 'deploy', 'status')))) {
+    add('security', 30, `Security${sec.source ? ` (${sec.source})` : ''}`, [
+      `${sec.critical} critical, ${sec.high} high`,
+      ...(sec.top ?? []).slice(0, want('security') ? 6 : 3).map((i) => `- ${i.sev ? i.sev + ': ' : ''}${fit(i.name, 120)}`),
+    ])
+  }
+
+  // What changed since the last prompt
+  add('since', 1000, 'Since your last message', (x.delta ?? []).map((l) => `- ${l}`)) // never dropped
+
+  if (!sections.length) return ''
+  const head = `<harness_context source="harness-platform" project="${c.org_id ?? ''}/${c.project_id ?? ''}" as_of="${now ? stamp(now) : ''}">${x.scopeNote ? `\n(${x.scopeNote})` : ''}`
+  const foot = 'More: harness_status (view: inventory | modules; diagnose: <run id>).\n</harness_context>'
+  const ORDER = ['since', 'build', 'deploy', 'approval', 'guardrails', 'security']
+  const render = (secs) => [head, ...ORDER.map((k) => secs.find((s) => s.key === k)).filter(Boolean).map((s) => `## ${s.title}\n${s.lines.join('\n')}`), foot].join('\n')
+  // Budget: drop whole sections, lowest priority first, then trim the last kept section's lines
+  const max = Math.max(100, Number(x.budget) || 1200) * 4 // the setting itself is clamped to 300–4000
+  let keep = [...sections]
+  while (render(keep).length > max && keep.length > 1) {
+    const lowest = keep.reduce((m, s) => (s.prio < m.prio ? s : m))
+    keep = keep.filter((s) => s !== lowest)
+  }
+  let out = render(keep)
+  // Still too long: trim lines, from the lowest-priority section up
+  for (const s of [...keep].sort((a, b) => a.prio - b.prio)) {
+    while (out.length > max && s.lines.length > 1) { s.lines.pop(); out = render(keep) }
+    if (out.length <= max) break
+  }
+  return out
+}
+
+// A small picture of state, to tell what changed between prompts
+export function contextSnapshot(v, x = {}) {
+  return {
+    head: v.branch?.head ?? '',
+    runs: Object.fromEntries((v.executions ?? []).slice(0, 15).map((r) => [r.planExecutionId, { s: r.status, l: runLabel(r) }])),
+    approvals: (x.approvals ?? []).map(({ a }) => a.id).sort(),
+    frozen: Boolean(x.freeze?.frozen),
+    pr: x.pr ? prLine(x.pr) : '',
+  }
+}
+
+export function contextDelta(prev, snap) {
+  if (!prev || !snap) return []
+  const L = []
+  if (prev.head && snap.head && prev.head !== snap.head) L.push(`HEAD moved ${short(prev.head)} → ${short(snap.head)}`)
+  for (const [id, r] of Object.entries(snap.runs)) {
+    const p = prev.runs[id]
+    const k = statusKind(r.s)
+    if (!p) L.push(`${r.l} started${k === 'run' ? '' : ` (now ${r.s})`}`)
+    else if (p.s !== r.s) L.push(k === 'wait' ? `${r.l} is waiting for approval` : k === 'run' ? `${r.l} is ${r.s}` : `${r.l} finished: ${r.s}`)
+  }
+  const added = snap.approvals.filter((id) => !prev.approvals.includes(id)).length
+  const gone = prev.approvals.filter((id) => !snap.approvals.includes(id)).length
+  if (added) L.push(`${added} new approval${added === 1 ? '' : 's'} waiting`)
+  if (gone) L.push(`${gone} approval${gone === 1 ? '' : 's'} decided or expired`)
+  if (prev.frozen !== snap.frozen) L.push(snap.frozen ? 'a deployment freeze started' : 'the deployment freeze ended')
+  if (prev.pr !== snap.pr && snap.pr) L.push(`PR now: ${snap.pr}`)
+  return L.slice(0, 8)
+}
+
+export const sameSnapshot = (a, b) => JSON.stringify(a) === JSON.stringify(b)
+
+// One line for a prompt whose context hasn't changed since the full block was sent
+export function contextUnchanged(v, x = {}) {
+  const h = v.branch?.headRun
+  const parts = [
+    v.branch ? `HEAD ${short(v.branch.head)} ${h ? h.status : 'not built'}` : '',
+    x.approvals?.length ? `${x.approvals.length} approval${x.approvals.length === 1 ? '' : 's'} waiting` : '',
+    x.freeze?.frozen ? 'freeze active' : '',
+  ].filter(Boolean)
+  return `[Harness, from the harness-platform plugin] No change since the Harness context sent with an earlier message${parts.length ? ` (${parts.join(', ')})` : ''}.`
 }
 
 export function autoFixPrompt(x, diag, attempt, max, url) {

@@ -354,13 +354,47 @@ The open pull request for your branch shows on the branch row, the band and the 
 
 ## What Claude sees
 
-**A tool.** Claude can call `harness_status` whenever builds or deploys come up. It returns, as compact JSON: whether HEAD is built, recent runs (status, branch, commit, what they deployed, failure, diagnosis, link), what's deployed where, how far prod is behind, waiting approvals, active freezes, and the PR. With `diagnose: <run id>` it diagnoses a run. With `scope: "all"` it covers the whole project.
+**A tool.** Claude can call `harness_status` whenever builds or deploys come up. It returns, as compact JSON: whether HEAD is built, recent runs (status, branch, commit, what they deployed, failure, diagnosis, link), what's deployed where, how far prod is behind, waiting approvals, active freezes, and the PR. With `diagnose: <run id>` it diagnoses a run. With `scope: "all"` it covers the whole project. With `view: "context"` it returns the full context block below.
 
-**A line of context.** On prompts about building, deploying, releasing, pipelines or production, the plugin adds one short line of current Harness state, so Claude knows the situation without a tool call (`add_context`). For example:
+**Context with your prompts** (`context_level`, default `rich`). The plugin reads what each prompt is about (build, deploy, security, PR, approvals, status) and adds the Harness state that answers it, so Claude starts from the facts instead of a tool call:
 
 ```text
-[Harness, from the harness-platform plugin] bootcamp-app@main (HEAD b0b0b0b): HEAD is CI CD #3 Running; bootcamp-app: dev 1-dev Expired, prod 3-dev Running; prod is 2 commits behind HEAD. Call the harness_status tool for details.
+<harness_context source="harness-platform" project="CS_Enablement/hcc_demo" as_of="2026-11-24 17:58 UTC">
+## Since your last message
+- CI CD #9 finished: Failed
+## Your change
+bootcamp-app @ hcc-demo, HEAD f52557b
+- f52557b (HEAD) "Simplify completion rate calculation" → CI CD #9 Failed 19m ago
+  failed at: Build: 1 error occurred: exit status 1
+  failing test: TaskManagerTest$StatsTests.completionRateIsRoundedPercentage:255 — expected: <33> but was: <0>
+  diagnosis: getCompletionRate() uses integer division; likely fix: multiply before dividing (high confidence)
+- 3518574 "Add completion rate to task stats" → CI CD #8 ApprovalWaiting 26m ago, deployed to dev + qa, waiting for approval
+- PR #1 → java-app: 2 checks failing · no reviewers (taskmanager_ci_cd-Build, taskmanager_pr_validation-Validate)
+- Push guard: a git push now waits for the user to confirm, because this branch is red in Harness
+## Deployments
+taskmanager:
+  dev: hcc-8 (CI CD #8, 3518574) 23m ago · newer attempt hcc-7 failed (CI CD #7); the version above stayed live
+  qa: hcc-8 (CI CD #8, 3518574) 22m ago
+  prod ★: prod_eu: hcc-4 (CI CD #4) · prod_us: hcc-6 (taskmanager hotfix deploy #3) ⚠ 2 versions · 1 manifest change not deployed · 3 commits behind HEAD
+## Waiting on people
+- CI CD #8: "Approve deploy of hcc-8 to prod (eu + us)" · expires in 23h 37m · approvers _project_all_users · asks for change_ticket
+## Guardrails in force
+- Production actions through the Harness MCP server need the user's confirmation
+- No freeze active · next: "Year-end holiday freeze" from 2026-12-23 18:00 UTC to 2027-01-04 09:00 UTC
+- OPA policy set "Prod guardrails" (on run), warning
+## Security (latest scan on hcc-demo: CI CD #8)
+15 critical, 61 high
+- Critical: CVE-2021-44228: Remote code injection in Log4j
+More: harness_status (view: inventory | modules; diagnose: <run id>).
+</harness_context>
 ```
+
+- **Only what the prompt is about.** Deployments, guardrails and security appear for deploy, approval and security questions; your change for build, PR and status questions, and whenever HEAD is red. Approvals waiting are always included.
+- **Failing tests, not boilerplate.** The failed step's log is searched for assertions and test summaries (Maven/Gradle, pytest and common compiler and runtime errors), which usually sit far above the last lines. The diagnosis gets them too.
+- **Security from your branch.** The newest scanned run on your branch (its Security tab), falling back to the project's baseline issues.
+- **Not repeated.** A second question about the same things, with nothing changed, gets one line ("No change since the Harness context sent with an earlier message …"). A prompt that isn't about Harness gets nothing, unless something happened since the last one: then a single `[Harness update …]` line (a run finished, an approval arrived, a freeze started).
+- **Bounded.** At most `context_budget` tokens (default 1200); the least relevant sections go first, "since your last message" never does.
+- `context_level: line` keeps the original single line; `off` (or `add_context: false`) sends nothing.
 
 The pane's write actions are for you, not Claude. Claude acts on Harness through the Harness MCP server, where the [guardrails](#guardrails) apply.
 
@@ -571,7 +605,9 @@ Set them in the installer, `/plugin configure harness-platform@harness-tools`, o
 | `push_guard` | `hold` | `hold` · `warn` · `off` |
 | `prod_guard` | `true` | ask before Claude's Harness actions on production |
 | `diagnose` | `auto` | `auto` · `on_demand` · `off` |
-| `add_context` | `true` | one line of Harness state on CI/deploy prompts |
+| `add_context` | `true` | add Harness state to prompts at all (`false` = off) |
+| `context_level` | `rich` | `rich` (sections by topic, see [What Claude sees](#what-claude-sees)) · `line` · `off` |
+| `context_budget` | `1200` | 300–4000 tokens the rich context may add to one prompt |
 | `poll_seconds` | `60` | 15–600; 10 s while watching a push |
 | `max_runs` | `50` | 10–100 recent runs per refresh |
 | `inventory_days` | `90` | 7–365 days of deploy history for the inventory |
@@ -595,6 +631,7 @@ Read at session start; useful per shell or in CI. The first four are the same on
 | `HARNESS_CICD_LAYOUT` | `layout` |
 | `HARNESS_PLATFORM_START` | `start_view` |
 | `HARNESS_CICD_ON_FAILURE` · `HARNESS_CICD_PUSH_GUARD` · `HARNESS_CICD_DIAGNOSE` | those settings |
+| `HARNESS_PLATFORM_CONTEXT` | `context_level` |
 | `HARNESS_CICD_ALLOW_ACTIONS=1` | turns on `allow_actions` |
 
 ---

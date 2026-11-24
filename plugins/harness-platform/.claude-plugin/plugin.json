@@ -131,8 +131,25 @@
     "add_context": {
       "type": "boolean",
       "title": "Add Harness context to prompts",
-      "description": "On prompts about builds, deploys or releases, add one line of current Harness state for Claude",
+      "description": "Add current Harness state to your prompts for Claude (how much: context_level). Off turns it off entirely",
       "default": true
+    },
+    "context_level": {
+      "type": "string",
+      "title": "Context detail",
+      "description": "rich: a block with the sections the prompt is about (your change and failing tests, deployments, approvals, guardrails, security), re-sent only when Harness changed · line: one line on CI/deploy prompts · off",
+      "options": [
+        "rich",
+        "line",
+        "off"
+      ],
+      "default": "rich"
+    },
+    "context_budget": {
+      "type": "number",
+      "title": "Context budget (tokens)",
+      "description": "Most the rich context may add to one prompt; lower-priority sections are dropped first (300–4000)",
+      "default": 1200
     },
     "layout": {
       "type": "string",

@@ -12,6 +12,7 @@ import {
   execCi, cdTargets, failureMessage, execUrl, projectUrl, buildView, toolSummary, textReport,
   failedSteps, logTail, DIAGNOSIS_SYSTEM, diagnosisPrompt, parseDiagnosis,
   isGitPush, isHarnessWrite, prodTargets, prodCommit, wantsContext, contextLine, autoFixPrompt,
+  classifyPrompt, contextBlock, contextSnapshot, contextDelta, sameSnapshot, contextUnchanged, failureSignals, failingTests,
   envCommits, SPARK, sparkRuns, failedStageIds, actionsFor,
   isApprovalWaiting, parseApprovals, expiresIn, approvalWhere, approvalBody,
   parseTemplateInputs, fillTemplate, parseFreeze, freezeText, harnessCodeRef, isGithubRemote,
@@ -82,6 +83,9 @@ const pendingCache = new Map() // "paths|since" → count
 // Platform modules (GitOps, security, flags, alerts, …) through the Harness MCP server
 const mods = { results: new Map(), at: 0, fetching: null, usedAt: 0, raw: new Map() }
 let changeFlags = { head: '', names: [] } // feature flags referenced in your change
+let policySets = [] // enabled OPA policy sets, for the context's guardrails (every 5 minutes, with freezes)
+const runSecurity = new Map() // planExecutionId → { critical, high, top } from that run's Security tab, or null
+let ctxLast = null // { snap, topics, at } of the Harness context last sent with a prompt
 const pick = (v, allowed, dflt) => (allowed.includes(v) ? v : dflt)
 
 // ---- Harness REST -----------------------------------------------------------
@@ -270,6 +274,57 @@ async function fetchFreeze($) {
   }
   if (gen !== scopeGen) return
   freeze = g || l ? parseFreeze(g, l, now) : null
+}
+
+// Only the rich context uses these: fetched when it's built, at most every 5 minutes
+let policyAt = 0
+async function fetchPolicySets($) {
+  const gen = scopeGen
+  const now = await $.clock.now()
+  if (policyAt && now - policyAt < 5 * 60_000) return
+  policyAt = now
+  let list = []
+  try {
+    if (cfg.auth === 'mcp') list = mcpItems(await mcp($, 'harness_list', { resource_type: 'policy_set', size: 50, compact: false }))
+    else { const j = await harnessJson($, 'GET', '/pm/api/v1/policysets', { per_page: '50' }); list = Array.isArray(j) ? j : Array.isArray(j?.data) ? j.data : [] }
+  } catch { list = [] }
+  if (gen !== scopeGen) return
+  policySets = list.filter((p) => p && p.enabled !== false && (p.name || p.identifier)).map((p) => ({
+    name: String(p.name ?? p.identifier), action: String(p.action ?? ''),
+    severity: [...new Set((p.policies ?? []).map((x) => x?.severity).filter(Boolean))].join('/'),
+  }))
+}
+
+// The Security tab of the newest scanned run on this branch (the project Issues page only holds baseline scans)
+async function fetchRunSecurity($, v) {
+  if (!cfg.modules.includes('security') || !v.branch) return null
+  const key = data.git?.name
+  const cands = data.executions.filter((r) => (!key || execRepoKeys(r).has(key)) && (execCi(r)?.branches ?? []).includes(v.branch.name) &&
+    (r.modules ?? []).includes('sto') && (isTerminal(statusKind(r.status)) || statusKind(r.status) === 'wait')).slice(0, 3)
+  for (const r of cands) {
+    if (!runSecurity.has(r.planExecutionId)) {
+      try {
+        const j = await mcp($, 'harness_list', { resource_type: 'pipeline_security_issue', filters: { execution_id: r.planExecutionId, severity_codes: 'Critical,High', page_size_new: 25, page_size_existing: 25 }, compact: false })
+        const n = (sev) => Number(j?.counts?.new?.[sev] ?? 0) + Number(j?.counts?.existing?.[sev] ?? 0)
+        const items = mcpItems(j)
+        runSecurity.set(r.planExecutionId, {
+          critical: n('critical'), high: n('high'),
+          top: items.filter((i) => /critical/i.test(i.severityCode ?? i.severity)).concat(items.filter((i) => !/critical/i.test(i.severityCode ?? i.severity)))
+            .map((i) => ({ name: String(i.title ?? i.key ?? ''), sev: String(i.severityCode ?? '') })).filter((i) => i.name),
+        })
+      } catch { runSecurity.set(r.planExecutionId, null) }
+    }
+    const sec = runSecurity.get(r.planExecutionId)
+    if (sec && (sec.critical || sec.high)) return { ...sec, source: `latest scan on ${v.branch.name}: ${runName(r)}` }
+  }
+  return null
+}
+
+function baselineSecurity() {
+  const items = mods.results.get('security')?.items
+  if (!items?.length) return null
+  const crit = items.filter((i) => /critical/i.test(i.sev)), high = items.filter((i) => /high/i.test(i.sev))
+  return { critical: crit.length, high: high.length, top: [...crit, ...high].map((i) => ({ name: i.name + (i.target ? ` (${i.target})` : ''), sev: i.sev })), source: 'project baseline' }
 }
 
 // ---- Pull request for this branch (every 2 minutes): Harness Code, or GitHub via gh ------
@@ -742,32 +797,44 @@ async function setAutoFix($, on) {
 
 async function fetchLogTail($, steps) {
   const step = steps.find((x) => x.logKey)
-  if (!step) return ''
+  if (!step) return { tail: '', signals: [] }
   try {
     const acct = encodeURIComponent(cfg.account_id)
     const tok = await $.http.fetch(`${cfg.base_url}/gateway/log-service/token?accountID=${acct}`, { headers: { 'x-api-key': cfg.api_key } })
-    if (!tok.ok) return ''
+    if (!tok.ok) return { tail: '', signals: [] }
     const blob = await $.http.fetch(`${cfg.base_url}/gateway/log-service/blob?accountID=${acct}&key=${encodeURIComponent(step.logKey)}`, { headers: { 'X-Harness-Token': tok.text.trim() } })
-    return blob.ok ? logTail(blob.text) : ''
+    return blob.ok ? { tail: logTail(blob.text), signals: failureSignals(blob.text) } : { tail: '', signals: [] }
   } catch {
-    return ''
+    return { tail: '', signals: [] }
   }
+}
+
+// harness_diagnose answers JSON with failed_step_logs: { "stage/step": { log_snippet } | "text" }
+function mcpLogText(j) {
+  const logs = j?.failed_step_logs ?? j?.execution?.failed_step_logs ?? {}
+  return Object.values(logs).map((v) => (typeof v === 'string' ? v : v?.log_snippet ?? '')).join('\n')
 }
 
 async function doDiagnose($, x) {
   try {
     let graph = null
     let tail = ''
+    let signals = []
     if (cfg.auth === 'mcp') {
-      try { tail = fit(JSON.stringify(await mcp($, 'harness_diagnose', { resource_type: 'pipeline', options: { execution_id: x.planExecutionId, include_logs: true, log_snippet_lines: 60, summary: true } })), 6000) } catch { tail = '' }
+      try {
+        const j = await mcp($, 'harness_diagnose', { resource_type: 'pipeline', options: { execution_id: x.planExecutionId, include_logs: true, log_snippet_lines: 200, summary: true } })
+        signals = failureSignals(mcpLogText(j))
+        tail = fit(JSON.stringify(j), 6000)
+      } catch { tail = '' }
     } else {
       try { graph = await harness($, 'GET', '/pipeline/api/pipelines/execution/v2/' + encodeURIComponent(x.planExecutionId), { renderFullBottomGraph: 'true' }) } catch { graph = null }
     }
     const steps = failedSteps(x, graph)
-    if (cfg.auth !== 'mcp') tail = await fetchLogTail($, steps)
-    const r = await $.model.complete({ model: 'haiku', system: DIAGNOSIS_SYSTEM, prompt: diagnosisPrompt(x, steps, tail, data.git), maxTokens: 400, timeoutMs: 25000 })
+    if (cfg.auth !== 'mcp') ({ tail, signals } = await fetchLogTail($, steps))
+    const r = await $.model.complete({ model: 'haiku', system: DIAGNOSIS_SYSTEM, prompt: diagnosisPrompt(x, steps, tail, data.git, signals), maxTokens: 400, timeoutMs: 25000 })
     const d = r.isAnswered ? parseDiagnosis(r.text) : null
-    const out = d ? { state: 'done', ...d, fromLogs: Boolean(tail) } : { state: 'error', error: r.reason || 'the model gave no answer' }
+    const found = { signals, tests: failingTests(signals) }
+    const out = d ? { state: 'done', ...d, fromLogs: Boolean(tail || signals.length), ...found } : { state: 'error', error: r.reason || 'the model gave no answer', ...found }
     diagnoses.set(x.planExecutionId, out)
     return out
   } catch (err) {
@@ -902,6 +969,45 @@ function notify($) {
   prevKinds = kinds
 }
 
+// ---- Rich context ---------------------------------------------------------------
+
+// Everything the block can say, from state the mod already holds (plus this branch's latest scan)
+async function contextInputs($, v, topics, now) {
+  const prev = scope
+  scope = 'mine'
+  const inventory = currentInventory()
+  scope = prev
+  if (['deploy', 'approval', 'status', 'build'].some((t) => topics.has(t))) await fetchPolicySets($).catch(() => {})
+  const wantSec = ['security', 'build', 'pr', 'deploy', 'status'].some((t) => topics.has(t))
+  const security = wantSec ? (await fetchRunSecurity($, v).catch(() => null)) ?? baselineSecurity() : null
+  return {
+    cfg, now, topics, budget: cfg.context_budget, behind, diagnoses, pr, freeze, approvals: waitingList(), inventory,
+    pending: pendingChanges, policySets, security, url: (r) => execUrl(cfg, r),
+    scopeNote: cfg.scope_away ? `Harness is showing ${scopeLabel()}, not this repo's ${scopeId(homeScope)}` : '',
+  }
+}
+
+async function richContext($, text) {
+  const topics = classifyPrompt(text)
+  const now = await $.clock.now()
+  const v = buildView(data, 'mine')
+  const snap = contextSnapshot(v, { approvals: waitingList(), freeze, pr })
+  const delta = contextDelta(ctxLast?.snap, snap)
+  // Not about Harness: say only what changed since last time, if anything
+  if (!topics.size) {
+    ctxLast = { snap, topics: ctxLast?.topics ?? new Set(), at: ctxLast?.at ?? 0 }
+    return delta.length ? `[Harness update, from the harness-platform plugin] ${delta.join('; ')}.` : ''
+  }
+  // Same state, same kind of question, recently: don't repeat the block
+  if (ctxLast?.at && !delta.length && sameSnapshot(ctxLast.snap, snap) && [...topics].every((t) => ctxLast.topics.has(t)) && now - ctxLast.at < 30 * 60_000) {
+    return contextUnchanged(v, { approvals: waitingList(), freeze })
+  }
+  const block = contextBlock(v, { ...(await contextInputs($, v, topics, now)), delta })
+  const keepTopics = !delta.length && ctxLast?.topics ? ctxLast.topics : []
+  ctxLast = { snap, topics: new Set([...topics, ...keepTopics]), at: now }
+  return block
+}
+
 // ---- Hooks --------------------------------------------------------------------
 
 export function register(on, options) {
@@ -923,6 +1029,8 @@ export function register(on, options) {
     prod_guard: options.prod_guard !== false,
     diagnose: pick(options.diagnose, ['auto', 'on_demand', 'off'], 'auto'),
     add_context: options.add_context !== false,
+    context_level: options.add_context === false ? 'off' : pick(options.context_level, ['off', 'line', 'rich'], 'rich'),
+    context_budget: Math.min(4000, Math.max(300, Number(options.context_budget) || 1200)),
     layout: pick(options.layout, LAYOUTS, 'stacked'),
     start_view: pick(options.start_view, START_VIEWS, 'home'),
     mcp_server: String(options.mcp_server || ''),
@@ -987,6 +1095,7 @@ export function register(on, options) {
     cfg.on_failure = pick(String((await $.env.get('HARNESS_CICD_ON_FAILURE')) ?? ''), ['notify', 'ask', 'auto'], cfg.on_failure)
     cfg.push_guard = pick(String((await $.env.get('HARNESS_CICD_PUSH_GUARD')) ?? ''), ['hold', 'warn', 'off'], cfg.push_guard)
     cfg.diagnose = pick(String((await $.env.get('HARNESS_CICD_DIAGNOSE')) ?? ''), ['auto', 'on_demand', 'off'], cfg.diagnose)
+    cfg.context_level = pick(String((await $.env.get('HARNESS_PLATFORM_CONTEXT')) ?? ''), ['off', 'line', 'rich'], cfg.context_level)
     $.clock.after(500, () => { if (!lastAttempt && !pending) refresh($) })
     $.clock.every(5000, async () => {
       if (error === 'not configured') return // options only change on reload
@@ -1011,7 +1120,7 @@ export function register(on, options) {
           execution: { type: 'string', description: 'With action: the run to decide, by run number (12), planExecutionId or pipeline name. Optional when exactly one approval is waiting.' },
           comment: { type: 'string', description: 'With action: the comment to record in the approval history' },
           diagnose: { type: 'string', description: 'Optional planExecutionId of a failed run to diagnose from its failed steps and log tail' },
-          view: { type: 'string', enum: ['status', 'inventory', 'modules'], description: '"inventory": the live version of every service in every environment and infrastructure, with drift and in-flight deploys. "modules": GitOps apps, security issues, feature flags, alerts, incidents, releases, IaCM workspaces, cost anomalies, catalog, chaos and more' },
+          view: { type: 'string', enum: ['status', 'inventory', 'modules', 'context'], description: '"inventory": the live version of every service in every environment and infrastructure, with drift and in-flight deploys. "modules": GitOps apps, security issues, feature flags, alerts, incidents, releases, IaCM workspaces, cost anomalies, catalog, chaos and more. "context": the full Harness context block (your change with failing tests, deployments, approvals, guardrails, security)' },
         },
       },
     })
@@ -1117,6 +1226,12 @@ export function register(on, options) {
         }),
         flags_in_your_change: changeFlags.names.length ? changeFlags.names : undefined,
       }) }
+    }
+    if (e.view === 'context') {
+      const now = await $.clock.now()
+      const v = buildView(data, 'mine')
+      const all = new Set(['build', 'deploy', 'security', 'pr', 'approval', 'status'])
+      return { result: contextBlock(v, { ...(await contextInputs($, v, all, now)), budget: 4000 }) || 'No Harness state to report yet.' }
     }
     if (e.view === 'inventory') {
       inv.usedAt = await $.clock.now()
@@ -1235,9 +1350,16 @@ export function register(on, options) {
     return next(e)
   })
 
-  // Automatic context: one short line of Harness state on CI/deploy prompts
+  // Automatic context. rich (default): a block with the sections the prompt is about, re-sent in full only when
+  // Harness state changed, plus a one-line update on other prompts when something happened. line: the old one line.
   on('prompt.submit', async ($, e, next) => {
-    if (!cfg.add_context || !updatedAt || error || !wantsContext(e.text)) return next(e)
+    if (cfg.context_level === 'off' || !updatedAt || error) return next(e)
+    if (cfg.context_level === 'rich') {
+      let text = ''
+      try { text = await richContext($, e.text) } catch (err) { $.ui.log(`harness-platform: context skipped (${fit(String(err?.message ?? err), 120)})`) }
+      return text ? next({ ...e, context: [...(e.context ?? []), text] }) : next(e)
+    }
+    if (!wantsContext(e.text)) return next(e)
     const pend = [...pendingChanges].filter(([, n]) => n > 0).map(([k, n]) => { const [svc, env] = k.split('\u0000'); return `${data.services.find((x) => x.identifier === svc)?.name ?? svc}→${env}: ${n} manifest change${n === 1 ? '' : 's'} not deployed` })
     const line = contextLine(buildView(data, 'mine'), { behind, diagnoses, pr: [pr ? prLine(pr) : '', isCdOnly() ? 'CD-only repo (manifests here, no build in Harness)' : '', ...pend].filter(Boolean).join('; '), freeze: freeze?.frozen ? freezeText(freeze) : '' })
     const scoped = line && cfg.scope_away ? `${line} (Harness is showing ${scopeLabel()}, not this repo's ${scopeId(homeScope)})` : line
@@ -1423,6 +1545,7 @@ function resetScopeState() {
   error = null; updatedAt = 0; pending = null; lastAttempt = 0; failures = 0; burstUntil = 0; prevKinds = null
   diagnoses.clear(); diagRuns.clear(); fixAttempts.clear(); approvals.clear()
   seenApprovals = null; seenProdRuns = null; freeze = null; freezeAt = 0
+  policySets = []; policyAt = 0; runSecurity.clear(); ctxLast = null
   behind = null; behindByCommit = new Map()
   inv.store = new Map(); inv.scannedAt = 0; inv.usedAt = 0; inv.scanning = null; inv.runs = 0; inv.error = ''
   connectors.clear(); connectorsAt = 0; pendingChanges = new Map(); pendingCache.clear(); changeFlags = { head: '', names: [] }
